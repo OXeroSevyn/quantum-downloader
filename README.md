@@ -71,8 +71,8 @@ A fast, multi-segment download manager and video sniffer for desktop, built with
 **Checksums (SHA-256):**
 
 ```text
-Quantum Downloader Setup 1.0.0.exe : <paste checksum here>
-Quantum Downloader 1.0.0.exe       : <paste checksum here>
+Quantum Downloader Setup 1.0.0.exe : 6BC82B92FD12DC2CC4861F7012823A4B98B4C1C93495332AAB8404E38B0AB297
+Quantum Downloader 1.0.0.exe       : 30F6E13AE6E2D4AAFF9494B39261DBFB0ED0F256F0EEFB7B6B4DD95A1A87828F
 ```
 
 ---
@@ -184,3 +184,4 @@ Licensed under the **MIT License**. See the `LICENSE` file for details. The copy
 ---
 
 *Made with ❤️ by **Subham Dey** · [GitHub](https://github.com/OXeroSevyn) · [Blend Mode Studio](https://instagram.com/blendmodestudioofficial) · 2026*
+
