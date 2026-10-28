@@ -1,0 +1,34 @@
+{
+  "manifest_version": 3,
+  "name": "Quantum Downloader - Universal Video & Download Integration",
+  "version": "1.0.0",
+  "description": "Multi-connection download acceleration and video sniffer integration for Quantum Downloader",
+  "permissions": [
+    "downloads",
+    "webRequest",
+    "storage",
+    "tabs",
+    "contextMenus",
+    "scripting",
+    "activeTab",
+    "cookies"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "css": ["content.css"],
+      "run_at": "document_end"
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Quantum Downloader"
+  }
+}

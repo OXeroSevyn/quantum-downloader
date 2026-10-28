@@ -1,0 +1,9 @@
+{
+  "name": "com.quantum.downloader",
+  "description": "Quantum Downloader Native Messaging Bridge",
+  "path": "quantum_native_host.bat",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://*/"
+  ]
+}

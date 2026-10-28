@@ -147,3 +147,14 @@ vite.config.ts.timestamp-*
 
 # Turbo Repo
 .turbo
+
+# Build & binary outputs
+dist/
+dist-electron/
+dist-mac/
+dist-package/
+bin/
+*.exe
+*.dmg
+*.zip
+*.old
