@@ -4,7 +4,7 @@ A fast, multi-segment download manager and video sniffer for desktop, built with
 
 **Made by [Subham Dey](https://github.com/OXeroSevyn)**
 
-![Platform](https://img.shields.io/badge/platform-Windows-blue.svg) ![License](https://img.shields.io/badge/license-MIT-green.svg) ![Version](https://img.shields.io/badge/version-1.0.0-orange.svg)
+![Platform](https://img.shields.io/badge/platform-Windows-blue.svg) ![License](https://img.shields.io/badge/license-MIT-green.svg) ![Version](https://img.shields.io/badge/version-1.1.0-orange.svg)
 
 [![Download Installer](https://img.shields.io/badge/Download-Installer-blue.svg)](https://github.com/OXeroSevyn/quantum-downloader/releases/latest) [![Download Portable](https://img.shields.io/badge/Download-Portable-green.svg)](https://github.com/OXeroSevyn/quantum-downloader/releases/latest)
 
@@ -71,8 +71,8 @@ A fast, multi-segment download manager and video sniffer for desktop, built with
 **Checksums (SHA-256):**
 
 ```text
-Quantum Downloader Setup 1.0.0.exe : 6BC82B92FD12DC2CC4861F7012823A4B98B4C1C93495332AAB8404E38B0AB297
-Quantum Downloader 1.0.0.exe       : 30F6E13AE6E2D4AAFF9494B39261DBFB0ED0F256F0EEFB7B6B4DD95A1A87828F
+Quantum Downloader Setup 1.1.0.exe : 6B50CF38A4711E497782E02FF4ADF94A4B102AB5FE610C879DBEF69E6E3BB08B
+Quantum Downloader 1.1.0.exe       : 7F3BBC9400E852845239924C262DD927C2ABB0650ACFA3A8FF8DB8BB2DE38978
 ```
 
 ---
@@ -184,4 +184,5 @@ Licensed under the **MIT License**. See the `LICENSE` file for details. The copy
 ---
 
 *Made with ❤️ by **Subham Dey** · [GitHub](https://github.com/OXeroSevyn) · [Blend Mode Studio](https://instagram.com/blendmodestudioofficial) · 2026*
+
 
