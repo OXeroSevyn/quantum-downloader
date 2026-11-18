@@ -4,6 +4,7 @@ import http from 'http';
 import https from 'https';
 import { URL } from 'url';
 import { DownloadTask, DownloadSegment, DownloadCategory } from './types';
+import { RateLimiter } from './rate-limiter';
 
 export interface DownloaderEvents {
   onProgress: (task: DownloadTask) => void;
@@ -20,10 +21,16 @@ export class SegmentedDownloader {
   private speedTimer: NodeJS.Timeout | null = null;
   private lastBytesDownloaded: number = 0;
   private speedWindow: number[] = [];
+  private rateLimiter: RateLimiter | null = null;
 
-  constructor(task: DownloadTask, events: DownloaderEvents) {
+  constructor(task: DownloadTask, events: DownloaderEvents, rateLimiter?: RateLimiter) {
     this.task = task;
     this.events = events;
+    this.rateLimiter = rateLimiter || null;
+  }
+
+  public setRateLimiter(rateLimiter: RateLimiter | null): void {
+    this.rateLimiter = rateLimiter;
   }
 
   public async start(): Promise<void> {
@@ -80,16 +87,14 @@ export class SegmentedDownloader {
       if (fs.existsSync(this.task.filepath)) {
         fs.unlinkSync(this.task.filepath);
       }
-    } catch (e) {
-      // Ignore
-    }
+    } catch {}
   }
 
   private closeFile(): void {
     if (this.fileHandle !== null) {
       try {
         fs.closeSync(this.fileHandle);
-      } catch (e) {}
+      } catch {}
       this.fileHandle = null;
     }
   }
@@ -98,23 +103,33 @@ export class SegmentedDownloader {
     for (const req of this.activeStreams) {
       try {
         req.destroy();
-      } catch (e) {}
+      } catch {}
     }
     this.activeStreams = [];
   }
 
   private startSpeedCalculation(): void {
     this.stopSpeedCalculation();
-    this.speedTimer = setInterval(() => {
-      if (this.isPaused || this.task.status !== 'downloading') return;
-      const current = this.task.downloadedBytes;
-      const diff = Math.max(0, current - this.lastBytesDownloaded);
-      this.lastBytesDownloaded = current;
+    this.lastBytesDownloaded = this.task.downloadedBytes;
+    this.speedWindow = [];
 
-      this.speedWindow.push(diff);
-      if (this.speedWindow.length > 3) this.speedWindow.shift();
-      const avg = this.speedWindow.reduce((a, b) => a + b, 0) / this.speedWindow.length;
-      this.task.speed = Math.round(avg);
+    this.speedTimer = setInterval(() => {
+      if (this.isPaused || this.task.status !== 'downloading') {
+        this.stopSpeedCalculation();
+        return;
+      }
+
+      const currentBytes = this.task.downloadedBytes;
+      const bytesInLastSecond = Math.max(0, currentBytes - this.lastBytesDownloaded);
+      this.lastBytesDownloaded = currentBytes;
+
+      this.speedWindow.push(bytesInLastSecond);
+      if (this.speedWindow.length > 5) {
+        this.speedWindow.shift();
+      }
+
+      const avgSpeed = this.speedWindow.reduce((a, b) => a + b, 0) / this.speedWindow.length;
+      this.task.speed = Math.round(avgSpeed);
 
       this.events.onProgress(this.task);
     }, 1000);
@@ -299,6 +314,7 @@ export class SegmentedDownloader {
         total: end - start + 1,
         status: 'pending',
         speed: 0,
+        retries: 0,
       });
     }
 
@@ -308,11 +324,37 @@ export class SegmentedDownloader {
   private async runSegmentedDownload(): Promise<void> {
     const pendingSegments = this.task.segments.filter(s => s.status !== 'completed');
 
-    const downloadPromises = pendingSegments.map(segment => this.downloadSegment(segment));
+    const downloadPromises = pendingSegments.map(segment => this.downloadSegmentWithRetry(segment));
     await Promise.all(downloadPromises);
 
     if (!this.isPaused) {
       this.checkCompletion();
+    }
+  }
+
+  /**
+   * Resilient segment downloader with automatic retry and backoff (MDM-grade resilience)
+   */
+  private async downloadSegmentWithRetry(segment: DownloadSegment, maxRetries: number = 3): Promise<void> {
+    let attempt = 0;
+    while (attempt <= maxRetries && !this.isPaused) {
+      try {
+        await this.downloadSegment(segment);
+        return; // Success
+      } catch (err: any) {
+        attempt++;
+        segment.retries = attempt;
+        if (this.isPaused) return;
+
+        if (attempt > maxRetries) {
+          segment.status = 'error';
+          throw err;
+        }
+
+        // Exponential backoff wait (e.g. 500ms, 1500ms, 3000ms)
+        const delay = Math.min(500 * Math.pow(2, attempt - 1), 4000);
+        await new Promise(r => setTimeout(r, delay));
+      }
     }
   }
 
@@ -362,10 +404,17 @@ export class SegmentedDownloader {
 
         let offset = start;
 
-        res.on('data', (chunk: Buffer) => {
+        res.on('data', async (chunk: Buffer) => {
           if (this.isPaused) {
             req.destroy();
             return;
+          }
+
+          // Apply Bandwidth Throttling / Rate Limiting token consumption
+          if (this.rateLimiter && !this.rateLimiter.isUnlimited()) {
+            res.pause();
+            await this.rateLimiter.acquire(chunk.length);
+            if (!this.isPaused) res.resume();
           }
 
           if (this.fileHandle !== null) {
@@ -411,7 +460,7 @@ export class SegmentedDownloader {
     });
   }
 
-  // Dynamic chunk stealing (IDM dynamic multi-threading):
+  // Dynamic chunk stealing (IDM & MDM dynamic multi-threading):
   // When one thread completes, it checks if any other active thread has > 1MB remaining.
   // If so, it takes over the second half of that segment!
   private async attemptChunkStealing(): Promise<void> {
@@ -449,10 +498,11 @@ export class SegmentedDownloader {
         total: oldEnd - newStart + 1,
         status: 'pending',
         speed: 0,
+        retries: 0,
       };
 
       this.task.segments.push(newSegment);
-      await this.downloadSegment(newSegment);
+      await this.downloadSegmentWithRetry(newSegment);
     }
   }
 
@@ -461,32 +511,39 @@ export class SegmentedDownloader {
       const parsed = new URL(this.task.url);
       const client = parsed.protocol === 'https:' ? https : http;
 
-      const start = this.task.downloadedBytes;
-      const headers: Record<string, string> = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        ...(this.task.headers || {}),
+      const userAgent = this.task.headers?.['User-Agent'] || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36';
+
+      const options: http.RequestOptions = {
+        method: 'GET',
+        headers: {
+          'User-Agent': userAgent,
+          'Accept': '*/*',
+          ...(this.task.headers || {}),
+        },
       };
 
-      if (start > 0 && this.task.resumable) {
-        headers['Range'] = `bytes=${start}-`;
-      }
-
-      const req = client.request(this.task.url, { method: 'GET', headers }, (res) => {
+      const req = client.request(this.task.url, options, (res) => {
         if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
           this.task.url = new URL(res.headers.location, this.task.url).toString();
           return this.runSingleStreamDownload().then(resolve).catch(reject);
         }
 
-        if (res.statusCode !== 200 && res.statusCode !== 206) {
-          return reject(new Error(`Server responded with ${res.statusCode}`));
+        if (res.statusCode && res.statusCode >= 400) {
+          return reject(new Error(`Server responded with HTTP ${res.statusCode} (${res.statusMessage || ''})`));
         }
 
-        let offset = start;
+        let offset = 0;
 
-        res.on('data', (chunk: Buffer) => {
+        res.on('data', async (chunk: Buffer) => {
           if (this.isPaused) {
             req.destroy();
             return;
+          }
+
+          if (this.rateLimiter && !this.rateLimiter.isUnlimited()) {
+            res.pause();
+            await this.rateLimiter.acquire(chunk.length);
+            if (!this.isPaused) res.resume();
           }
 
           if (this.fileHandle !== null) {
@@ -495,8 +552,8 @@ export class SegmentedDownloader {
               offset += chunk.length;
               this.task.downloadedBytes += chunk.length;
               if (this.task.segments[0]) {
-                this.task.segments[0].currentByte = offset;
                 this.task.segments[0].downloaded += chunk.length;
+                this.task.segments[0].currentByte = offset;
               }
             } catch (err) {
               req.destroy();
@@ -587,7 +644,7 @@ export class SegmentedDownloader {
     const audioExts = ['.mp3', '.wav', '.flac', '.aac', '.ogg', '.m4a', '.wma'];
     const compExts = ['.zip', '.rar', '.7z', '.tar', '.gz', '.bz2', '.iso'];
     const docExts = ['.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.txt', '.csv'];
-    const progExts = ['.exe', '.msi', '.apk', '.bat', '.dmg', '.iso', '.bin'];
+    const progExts = ['.exe', '.msi', '.apk', '.bat', '.dmg', '.bin'];
 
     if (videoExts.includes(ext) || contentType.startsWith('video/')) return 'video';
     if (audioExts.includes(ext) || contentType.startsWith('audio/')) return 'audio';

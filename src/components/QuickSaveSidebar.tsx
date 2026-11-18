@@ -15,6 +15,7 @@ import {
   Settings,
   Clock,
   ChevronDown,
+  Radio,
 } from 'lucide-react';
 import { DownloadTask } from '../types';
 
@@ -40,6 +41,7 @@ export const QuickSaveSidebar: React.FC<Props> = ({
 
   const getCatCount = (cat: string) => {
     return tasks.filter(t => {
+      if (cat === 'torrent') return t.isTorrent || t.category === 'torrent' || t.url.startsWith('magnet:?') || t.filename.endsWith('.torrent');
       if (cat === 'video') return t.category === 'video' || /\.(mp4|mkv|avi|mov|webm)$/i.test(t.filename);
       if (cat === 'audio') return t.category === 'audio' || /\.(mp3|wav|flac|aac|ogg|m4a)$/i.test(t.filename);
       if (cat === 'compressed') return t.category === 'compressed' || /\.(zip|rar|7z|tar|gz)$/i.test(t.filename);
@@ -150,6 +152,23 @@ export const QuickSaveSidebar: React.FC<Props> = ({
         </div>
 
         <div className="sidebar-nav-list">
+          {/* Torrents & Magnets */}
+          <button
+            className={`sidebar-row-btn ${selectedCategory === 'torrent' ? 'active-primary' : ''}`}
+            onClick={() => {
+              onSelectCategory('torrent');
+              onSelectStatus('all');
+            }}
+          >
+            <div className="row-left">
+              <div className="cat-badge-square" style={{ background: '#0284c7' }}>
+                <Radio size={12} color="#fff" />
+              </div>
+              <span className="row-title">Torrents / Magnets</span>
+            </div>
+            <span className="row-pill-badge">{getCatCount('torrent')}</span>
+          </button>
+
           {/* Video */}
           <button
             className={`sidebar-row-btn ${selectedCategory === 'video' ? 'active-primary' : ''}`}

@@ -243,8 +243,8 @@ function registerIpcHandlers() {
     return downloadManager.getAllTasks();
   });
 
-  ipcMain.handle('add-download', (_event, { url, filename, category, headers, quality, formatId }) => {
-    return downloadManager.addTask(url, filename, category, headers, quality, formatId);
+  ipcMain.handle('add-download', (_event, { url, filename, category, headers, quality, formatId, queueName, priority }) => {
+    return downloadManager.addTask(url, filename, category, headers, quality, formatId, queueName, priority);
   });
 
   ipcMain.handle('pause-download', (_event, id: string) => {

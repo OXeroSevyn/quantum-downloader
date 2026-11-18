@@ -134,10 +134,12 @@ export const App: React.FC = () => {
     category?: DownloadCategory,
     headers?: Record<string, string>,
     quality?: string,
-    formatId?: string
+    formatId?: string,
+    queueName?: string,
+    priority?: number
   ) => {
     if (window.quantumApi) {
-      const task = await window.quantumApi.addDownload(url, filename, category, headers, quality, formatId);
+      const task = await window.quantumApi.addDownload(url, filename, category, headers, quality, formatId, queueName, priority);
       setTasks(prev => [task, ...prev.filter(t => t.id !== task.id)]);
       setSelectedTaskId(task.id);
     }

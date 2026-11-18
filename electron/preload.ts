@@ -3,8 +3,8 @@ import { AppSettings, DownloadCategory } from './engine/types';
 
 export const quantumApi = {
   getDownloads: () => ipcRenderer.invoke('get-downloads'),
-  addDownload: (url: string, filename?: string, category?: DownloadCategory, headers?: Record<string, string>, quality?: string, formatId?: string) =>
-    ipcRenderer.invoke('add-download', { url, filename, category, headers, quality, formatId }),
+  addDownload: (url: string, filename?: string, category?: DownloadCategory, headers?: Record<string, string>, quality?: string, formatId?: string, queueName?: string, priority?: number) =>
+    ipcRenderer.invoke('add-download', { url, filename, category, headers, quality, formatId, queueName, priority }),
   pauseDownload: (id: string) => ipcRenderer.invoke('pause-download', id),
   stopDownload: (id: string) => ipcRenderer.invoke('stop-download', id),
   resumeDownload: (id: string) => ipcRenderer.invoke('resume-download', id),

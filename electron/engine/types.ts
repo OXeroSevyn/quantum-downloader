@@ -1,6 +1,6 @@
 export type DownloadStatus = 'queued' | 'downloading' | 'paused' | 'completed' | 'error';
 
-export type DownloadCategory = 'video' | 'audio' | 'compressed' | 'document' | 'program' | 'other';
+export type DownloadCategory = 'video' | 'audio' | 'compressed' | 'document' | 'program' | 'torrent' | 'other';
 
 export interface DownloadSegment {
   id: number;
@@ -11,6 +11,7 @@ export interface DownloadSegment {
   total: number;
   status: 'pending' | 'downloading' | 'completed' | 'error';
   speed: number; // bytes/sec for this segment
+  retries?: number;
 }
 
 export interface VideoFormatOption {
@@ -44,24 +45,40 @@ export interface DownloadTask {
   headers?: Record<string, string>;
   isHls?: boolean;
   isVideoStream?: boolean;
+  isTorrent?: boolean;
+  torrentPeers?: number;
+  torrentProgress?: number;
   quality?: string;
   formatId?: string;
   thumbnailUrl?: string;
   description?: string;
   lastTry?: string;
   logs?: string[];
+  queueName?: string;
+  priority?: number; // Higher number = higher priority
+}
+
+export interface QueueSchedule {
+  enabled: boolean;
+  startHour: number; // 0-23
+  startMinute: number; // 0-59
+  stopHour: number; // 0-23
+  stopMinute: number; // 0-59
+  autoShutdownOnComplete?: boolean;
 }
 
 export interface AppSettings {
   downloadDir: string;
   defaultConnections: number;
   maxActiveDownloads: number;
-  speedLimitKBps: number;
+  speedLimitKBps: number; // 0 = unlimited
   theme: 'light' | 'dark' | string;
   autoResumeOnStartup: boolean;
   enableClipboardMonitor: boolean;
   serverPort: number;
   hasCompletedWelcome?: boolean;
+  schedule?: QueueSchedule;
+  autoShutdownOnQueueComplete?: boolean;
 }
 
 export interface SniffedMedia {

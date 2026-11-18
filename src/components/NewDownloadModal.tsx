@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { X, Globe, Link2, FileText, Cpu, Download, Folder, Check } from 'lucide-react';
+import { X, Globe, Link2, FileText, Cpu, Download, Folder, Check, Radio } from 'lucide-react';
 import { DownloadCategory } from '../types';
 
 interface Props {
@@ -17,7 +17,9 @@ interface Props {
     category?: DownloadCategory,
     headers?: Record<string, string>,
     quality?: string,
-    formatId?: string
+    formatId?: string,
+    queueName?: string,
+    priority?: number
   ) => void;
 }
 
@@ -36,12 +38,15 @@ export const NewDownloadModal: React.FC<Props> = ({
   const [filename, setFilename] = useState('');
   const [category, setCategory] = useState<DownloadCategory>('other');
   const [threads, setThreads] = useState<number>(16);
+  const [queueName, setQueueName] = useState<string>('Default');
+  const [priority, setPriority] = useState<number>(0);
   const [headers, setHeaders] = useState<Record<string, string> | undefined>(undefined);
   const [quality, setQuality] = useState<string | undefined>(undefined);
   const [formatId, setFormatId] = useState<string | undefined>(undefined);
 
   const detectCategoryFromFilename = (name: string): DownloadCategory => {
     const ext = name.split('.').pop()?.toLowerCase() || '';
+    if (name.startsWith('magnet:?') || ext === 'torrent') return 'torrent';
     if (['mp4', 'mkv', 'avi', 'mov', 'webm'].includes(ext)) return 'video';
     if (['mp3', 'wav', 'flac', 'aac', 'ogg', 'm4a'].includes(ext)) return 'audio';
     if (['zip', 'rar', '7z', 'tar', 'gz', 'iso'].includes(ext)) return 'compressed';
@@ -60,17 +65,24 @@ export const NewDownloadModal: React.FC<Props> = ({
 
       let detectedName = initialFilename || '';
       if (!detectedName && targetUrl) {
-        try {
-          const u = new URL(targetUrl);
-          const base = u.pathname.split('/').pop();
-          if (base && base.includes('.')) {
-            detectedName = decodeURIComponent(base);
-          }
-        } catch (e) {}
+        if (targetUrl.startsWith('magnet:?')) {
+          const dnMatch = targetUrl.match(/[?&]dn=([^&]+)/i);
+          detectedName = dnMatch ? decodeURIComponent(dnMatch[1]) : '';
+        } else {
+          try {
+            const u = new URL(targetUrl);
+            const base = u.pathname.split('/').pop();
+            if (base && base.includes('.')) {
+              detectedName = decodeURIComponent(base);
+            }
+          } catch (e) {}
+        }
       }
       setFilename(detectedName);
 
-      if (initialCategory && initialCategory !== 'other') {
+      if (targetUrl.startsWith('magnet:?') || targetUrl.endsWith('.torrent')) {
+        setCategory('torrent');
+      } else if (initialCategory && initialCategory !== 'other') {
         setCategory(initialCategory);
       } else if (detectedName) {
         setCategory(detectCategoryFromFilename(detectedName));
@@ -92,12 +104,16 @@ export const NewDownloadModal: React.FC<Props> = ({
       category !== 'other' ? category : undefined,
       headers,
       quality,
-      formatId
+      formatId,
+      queueName,
+      priority
     );
     setUrl('');
     setFilename('');
     onClose();
   };
+
+  const isTorrent = url.trim().startsWith('magnet:?') || url.trim().endsWith('.torrent');
 
   return (
     <div className="glass-modal-overlay" onClick={onClose}>
@@ -109,7 +125,9 @@ export const NewDownloadModal: React.FC<Props> = ({
             </div>
             <div>
               <div style={{ fontWeight: 800, fontSize: '15px' }}>Download File Info</div>
-              <div style={{ fontSize: '11px', color: '#64748b', fontWeight: 500 }}>Quantum Accelerator • 16-Segment Multi-Threading</div>
+              <div style={{ fontSize: '11px', color: '#64748b', fontWeight: 500 }}>
+                {isTorrent ? 'BitTorrent / Magnet Swarm Engine' : 'Quantum Accelerator • 16-Segment Multi-Threading'}
+              </div>
             </div>
           </div>
           <button className="glass-modal-close-btn" onClick={onClose} type="button" aria-label="Close">
@@ -122,25 +140,34 @@ export const NewDownloadModal: React.FC<Props> = ({
             {/* URL Input */}
             <div className="glass-form-group">
               <label className="glass-form-label">
-                <Link2 size={15} color="#2563eb" /> Download Link / Source URL *
+                <Link2 size={15} color="#2563eb" /> Download Link / Magnet / Video URL *
               </label>
               <input
                 type="text"
                 className="glass-form-input"
-                placeholder="https://example.com/file.zip or YouTube video URL..."
+                placeholder="https://... or magnet:?xt=urn:btih:..."
                 required
                 autoFocus
                 value={url}
                 onChange={(e) => {
-                  setUrl(e.target.value);
-                  try {
-                    const u = new URL(e.target.value);
-                    const base = u.pathname.split('/').pop();
-                    if (base && base.includes('.') && !filename) {
-                      setFilename(decodeURIComponent(base));
-                      setCategory(detectCategoryFromFilename(base));
+                  const val = e.target.value;
+                  setUrl(val);
+                  if (val.startsWith('magnet:?')) {
+                    setCategory('torrent');
+                    const dnMatch = val.match(/[?&]dn=([^&]+)/i);
+                    if (dnMatch && !filename) {
+                      setFilename(decodeURIComponent(dnMatch[1]));
                     }
-                  } catch {}
+                  } else {
+                    try {
+                      const u = new URL(val);
+                      const base = u.pathname.split('/').pop();
+                      if (base && base.includes('.') && !filename) {
+                        setFilename(decodeURIComponent(base));
+                        setCategory(detectCategoryFromFilename(base));
+                      }
+                    } catch {}
+                  }
                 }}
               />
             </div>
@@ -153,7 +180,7 @@ export const NewDownloadModal: React.FC<Props> = ({
               <input
                 type="text"
                 className="glass-form-input"
-                placeholder="e.g. Tekken-5-Dark-Resurrection-AnkerGames.zip"
+                placeholder="e.g. Ubuntu-24.04-desktop-amd64.iso"
                 value={filename}
                 onChange={(e) => {
                   setFilename(e.target.value);
@@ -174,6 +201,7 @@ export const NewDownloadModal: React.FC<Props> = ({
                   onChange={(e) => setCategory(e.target.value as DownloadCategory)}
                 >
                   <option value="other">Auto Detect</option>
+                  <option value="torrent">BitTorrent / Magnet</option>
                   <option value="compressed">Compressed Archives (.zip, .rar)</option>
                   <option value="video">Video & Streams (.mp4, .mkv)</option>
                   <option value="audio">Music / Audio (.mp3, .wav)</option>
@@ -199,7 +227,38 @@ export const NewDownloadModal: React.FC<Props> = ({
                   value={threads}
                   onChange={(e) => setThreads(parseInt(e.target.value, 10))}
                   className="glass-range-slider"
+                  disabled={isTorrent}
                 />
+              </div>
+            </div>
+
+            {/* Queue & Priority */}
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px', marginTop: '8px' }}>
+              <div className="glass-form-group">
+                <label className="glass-form-label">Assign to Queue</label>
+                <select
+                  className="glass-form-select"
+                  value={queueName}
+                  onChange={(e) => setQueueName(e.target.value)}
+                >
+                  <option value="Default">Main Queue</option>
+                  <option value="Work">Work & Projects</option>
+                  <option value="Media">Media & Movies</option>
+                  <option value="Large">Large Torrents / ISOs</option>
+                </select>
+              </div>
+
+              <div className="glass-form-group">
+                <label className="glass-form-label">Priority Order</label>
+                <select
+                  className="glass-form-select"
+                  value={priority}
+                  onChange={(e) => setPriority(parseInt(e.target.value, 10))}
+                >
+                  <option value={10}>Highest Priority (Download First)</option>
+                  <option value={0}>Normal Priority</option>
+                  <option value={-10}>Low Priority (Download Last)</option>
+                </select>
               </div>
             </div>
           </div>

@@ -34,6 +34,15 @@ export class StorageManager {
       autoResumeOnStartup: true,
       enableClipboardMonitor: true,
       serverPort: 52345,
+      schedule: {
+        enabled: false,
+        startHour: 1,
+        startMinute: 0,
+        stopHour: 6,
+        stopMinute: 0,
+        autoShutdownOnComplete: false,
+      },
+      autoShutdownOnQueueComplete: false,
     };
 
     try {
@@ -63,20 +72,18 @@ export class StorageManager {
     try {
       if (fs.existsSync(this.downloadsPath)) {
         const raw = fs.readFileSync(this.downloadsPath, 'utf-8');
-        const tasks = JSON.parse(raw);
-        if (Array.isArray(tasks)) {
-          // Filter out any legacy dummy/demo tasks and save clean state
-          const realTasks: DownloadTask[] = tasks.filter((t: any) => t && t.id && !t.id.startsWith('task-demo-'));
-          if (realTasks.length !== tasks.length) {
-            this.saveDownloads(realTasks);
-          }
-          // Mark any tasks that were downloading as paused on startup
-          return realTasks.map(t => ({
-            ...t,
-            status: t.status === 'downloading' ? 'paused' : t.status,
+        const parsed: DownloadTask[] = JSON.parse(raw);
+        // Reset speed and downloading status to paused on boot
+        return parsed.map((task) => ({
+          ...task,
+          speed: 0,
+          status: task.status === 'downloading' ? 'paused' : task.status,
+          segments: task.segments ? task.segments.map(s => ({
+            ...s,
             speed: 0,
-          }));
-        }
+            status: s.status === 'downloading' ? 'pending' : s.status,
+          })) : [],
+        }));
       }
     } catch (err) {
       console.error('Error loading downloads:', err);
@@ -86,7 +93,12 @@ export class StorageManager {
 
   public saveDownloads(downloads: DownloadTask[]): void {
     try {
-      fs.writeFileSync(this.downloadsPath, JSON.stringify(downloads, null, 2), 'utf-8');
+      // Don't save transient internal objects
+      const serialized = downloads.map(d => ({
+        ...d,
+        speed: d.status === 'downloading' ? d.speed : 0,
+      }));
+      fs.writeFileSync(this.downloadsPath, JSON.stringify(serialized, null, 2), 'utf-8');
     } catch (err) {
       console.error('Error saving downloads:', err);
     }

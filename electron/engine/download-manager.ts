@@ -5,17 +5,32 @@ import { DownloadTask, AppSettings, DownloadCategory } from './types';
 import { SegmentedDownloader } from './segmented-downloader';
 import { HlsDownloader } from './hls-downloader';
 import { VideoStreamDownloader } from './video-stream-downloader';
+import { TorrentDownloader } from './torrent-downloader';
+import { RateLimiter } from './rate-limiter';
+import { SchedulerManager } from './scheduler';
 
 export class DownloadManager {
   private storage: StorageManager;
   private tasks: Map<string, DownloadTask> = new Map();
-  private activeWorkers: Map<string, SegmentedDownloader | HlsDownloader | VideoStreamDownloader> = new Map();
+  private activeWorkers: Map<string, SegmentedDownloader | HlsDownloader | VideoStreamDownloader | TorrentDownloader> = new Map();
   private settings: AppSettings;
   private mainWindow: BrowserWindow | null = null;
+  private rateLimiter: RateLimiter;
+  private scheduler: SchedulerManager;
 
   constructor(storage: StorageManager) {
     this.storage = storage;
     this.settings = this.storage.getSettings();
+
+    // Initialize global bandwidth rate limiter
+    this.rateLimiter = new RateLimiter(this.settings.speedLimitKBps || 0);
+
+    // Initialize schedule manager
+    this.scheduler = new SchedulerManager(
+      () => this.resumeAllQueued(),
+      () => this.pauseAllDownloading()
+    );
+    this.scheduler.setSchedule(this.settings.schedule);
 
     // Load persisted tasks
     const saved = this.storage.getDownloads();
@@ -34,12 +49,29 @@ export class DownloadManager {
 
   public updateSettings(newSettings: Partial<AppSettings>): AppSettings {
     this.settings = { ...this.settings, ...newSettings };
+    
+    // Update rate limiter
+    if (newSettings.speedLimitKBps !== undefined) {
+      this.rateLimiter.setLimit(this.settings.speedLimitKBps || 0);
+    }
+
+    // Update scheduler
+    if (newSettings.schedule !== undefined) {
+      this.scheduler.setSchedule(this.settings.schedule);
+    }
+
     this.storage.saveSettings(this.settings);
     return this.settings;
   }
 
   public getAllTasks(): DownloadTask[] {
-    return Array.from(this.tasks.values()).sort((a, b) => b.createdAt - a.createdAt);
+    return Array.from(this.tasks.values()).sort((a, b) => {
+      // Sort by priority (descending), then by createdAt (descending)
+      const pA = a.priority || 0;
+      const pB = b.priority || 0;
+      if (pA !== pB) return pB - pA;
+      return b.createdAt - a.createdAt;
+    });
   }
 
   public addTask(
@@ -48,13 +80,21 @@ export class DownloadManager {
     category?: DownloadCategory,
     headers?: Record<string, string>,
     quality?: string,
-    formatId?: string
+    formatId?: string,
+    queueName?: string,
+    priority?: number
   ): DownloadTask {
     const id = 'qd_' + Date.now().toString(36) + '_' + Math.random().toString(36).substring(2, 6);
     
     // Normalize URL
     let cleanUrl = url.trim();
-    if (!/^https?:\/\//i.test(cleanUrl)) {
+
+    // Detect BitTorrent / Magnet links
+    const isMagnet = cleanUrl.startsWith('magnet:?');
+    const isTorrentFile = cleanUrl.endsWith('.torrent') || cleanUrl.includes('.torrent?');
+    const isTorrent = isMagnet || isTorrentFile;
+
+    if (!isMagnet && !/^https?:\/\//i.test(cleanUrl)) {
       cleanUrl = 'https://' + cleanUrl;
     }
 
@@ -62,8 +102,8 @@ export class DownloadManager {
     const isKnownVideoHost = 
       /youtube\.com|youtu\.be|vimeo\.com|dailymotion\.com|tiktok\.com|twitter\.com|x\.com|instagram\.com|twitch\.tv|soundcloud\.com/i.test(cleanUrl);
     const hasExplicitVideoFormat = Boolean(formatId) || (Boolean(quality) && quality !== 'Auto Detect');
-    const isVideoPlatform = isKnownVideoHost || hasExplicitVideoFormat;
-    const isHls = !isVideoPlatform && (cleanUrl.includes('.m3u8') || cleanUrl.includes('manifest.m3u8'));
+    const isVideoPlatform = !isTorrent && (isKnownVideoHost || hasExplicitVideoFormat);
+    const isHls = !isTorrent && !isVideoPlatform && (cleanUrl.includes('.m3u8') || cleanUrl.includes('manifest.m3u8'));
 
     // Ensure target download directory exists
     const downloadDir = this.settings.downloadDir || path.join(process.cwd(), 'QuantumDownloads');
@@ -76,11 +116,17 @@ export class DownloadManager {
 
     let filename = customFilename || '';
     if (!filename) {
-      try {
-        const parsed = new URL(cleanUrl);
-        filename = path.basename(parsed.pathname) || `download_${Date.now()}`;
-      } catch {
-        filename = `download_${Date.now()}`;
+      if (isMagnet) {
+        // Extract display name from magnet if available dn=
+        const dnMatch = cleanUrl.match(/[?&]dn=([^&]+)/i);
+        filename = dnMatch ? decodeURIComponent(dnMatch[1]) : `torrent_${Date.now()}`;
+      } else {
+        try {
+          const parsed = new URL(cleanUrl);
+          filename = path.basename(parsed.pathname) || `download_${Date.now()}`;
+        } catch {
+          filename = `download_${Date.now()}`;
+        }
       }
     }
 
@@ -98,14 +144,12 @@ export class DownloadManager {
 
     // Extract real YouTube thumbnail if applicable
     let thumbnailUrl: string | undefined = undefined;
-    const ytMatch = cleanUrl.match(/(?:youtube\.com\/(?:[^\/]+\/.+\/|(?:v|e(?:mbed)?)\/|.*[?&]v=)|youtu\.be\/)([^"&?\/\s]{11})/i);
-    if (ytMatch && ytMatch[1]) {
-      thumbnailUrl = `https://img.youtube.com/vi/${ytMatch[1]}/hqdefault.jpg`;
+    if (cleanUrl.includes('youtube.com') || cleanUrl.includes('youtu.be')) {
+      const ytIdMatch = cleanUrl.match(/(?:v=|\/embed\/|youtu\.be\/|\/shorts\/)([a-zA-Z0-9_-]{11})/);
+      if (ytIdMatch && ytIdMatch[1]) {
+        thumbnailUrl = `https://img.youtube.com/vi/${ytIdMatch[1]}/mqdefault.jpg`;
+      }
     }
-
-    const now = new Date();
-    const timeStr = now.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
-    const dateStr = now.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) + ' ' + now.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false });
 
     const task: DownloadTask = {
       id,
@@ -118,29 +162,27 @@ export class DownloadManager {
       status: 'queued',
       connections: this.settings.defaultConnections || 16,
       segments: [],
-      category: category || (isVideoPlatform || isHls ? 'video' : 'other'),
+      category: isTorrent ? 'torrent' : (category || (isHls || isVideoPlatform ? 'video' : 'other')),
       createdAt: Date.now(),
       resumable: true,
       headers,
       isHls,
       isVideoStream: isVideoPlatform,
+      isTorrent,
       quality,
       formatId,
       thumbnailUrl,
-      description: isVideoPlatform ? 'YouTube Video / Stream' : (category ? `${category.toUpperCase()} File` : 'Binary Stream'),
-      lastTry: dateStr,
-      logs: [
-        `[${timeStr}] Download initialized: ${cleanUrl}`,
-        `[${timeStr}] Output path assigned: ${filepath}`,
-      ],
+      queueName: queueName || 'Default',
+      priority: priority !== undefined ? priority : 0,
     };
 
     this.tasks.set(id, task);
     this.persist();
     this.notifyFrontend('task-added', task);
 
-    // Schedule next
+    // Check if we can start immediately
     this.checkQueue();
+
     return task;
   }
 
@@ -148,24 +190,13 @@ export class DownloadManager {
     const task = this.tasks.get(id);
     if (!task) return;
 
-    task.status = 'queued';
-    task.errorMessage = undefined;
-
-    // If download failed with 0 bytes downloaded, reset to allow fresh re-probe
-    if (task.downloadedBytes === 0) {
-      task.segments = [];
-      task.totalBytes = 0;
-    } else {
-      task.segments.forEach(s => {
-        if (s.status === 'error') {
-          s.status = 'pending';
-        }
-      });
+    if (task.status === 'paused' || task.status === 'error') {
+      task.status = 'queued';
+      task.errorMessage = undefined;
+      this.persist();
+      this.notifyFrontend('task-updated', task);
+      this.checkQueue();
     }
-
-    this.persist();
-    this.notifyFrontend('task-updated', task);
-    this.checkQueue();
   }
 
   public pauseTask(id: string): void {
@@ -186,8 +217,26 @@ export class DownloadManager {
   }
 
   public stopTask(id: string): void {
-    // Stop is pause with full connection abort
     this.pauseTask(id);
+  }
+
+  public pauseAllDownloading(): void {
+    for (const [id, task] of this.tasks.entries()) {
+      if (task.status === 'downloading' || task.status === 'queued') {
+        this.pauseTask(id);
+      }
+    }
+  }
+
+  public resumeAllQueued(): void {
+    for (const task of this.tasks.values()) {
+      if (task.status === 'paused') {
+        task.status = 'queued';
+        task.errorMessage = undefined;
+      }
+    }
+    this.persist();
+    this.checkQueue();
   }
 
   public cancelTask(id: string): void {
@@ -212,7 +261,12 @@ export class DownloadManager {
       const fs = require('fs');
       try {
         if (fs.existsSync(task.filepath)) {
-          fs.unlinkSync(task.filepath);
+          const stat = fs.statSync(task.filepath);
+          if (stat.isDirectory()) {
+            fs.rmSync(task.filepath, { recursive: true, force: true });
+          } else {
+            fs.unlinkSync(task.filepath);
+          }
         }
       } catch (e) {}
     }
@@ -238,9 +292,19 @@ export class DownloadManager {
 
     if (activeCount >= maxActive) return;
 
-    const queued = Array.from(this.tasks.values()).find(t => t.status === 'queued');
-    if (queued) {
-      this.startTask(queued);
+    // Pick highest priority queued task
+    const queuedTasks = Array.from(this.tasks.values())
+      .filter(t => t.status === 'queued')
+      .sort((a, b) => (b.priority || 0) - (a.priority || 0));
+
+    if (queuedTasks.length > 0) {
+      const nextTask = queuedTasks[0];
+      this.startTask(nextTask);
+    } else if (activeCount === 0) {
+      // Queue is completely finished!
+      if (this.settings.autoShutdownOnQueueComplete || (this.settings.schedule?.enabled && this.settings.schedule.autoShutdownOnComplete)) {
+        this.scheduler.shutdownSystem();
+      }
     }
   }
 
@@ -269,13 +333,15 @@ export class DownloadManager {
       },
     };
 
-    let worker: SegmentedDownloader | HlsDownloader | VideoStreamDownloader;
-    if (task.isVideoStream) {
+    let worker: SegmentedDownloader | HlsDownloader | VideoStreamDownloader | TorrentDownloader;
+    if (task.isTorrent) {
+      worker = new TorrentDownloader(task, events);
+    } else if (task.isVideoStream) {
       worker = new VideoStreamDownloader(task, events);
     } else if (task.isHls) {
       worker = new HlsDownloader(task, events);
     } else {
-      worker = new SegmentedDownloader(task, events);
+      worker = new SegmentedDownloader(task, events, this.rateLimiter);
     }
 
     this.activeWorkers.set(task.id, worker);

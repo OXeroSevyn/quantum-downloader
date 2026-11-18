@@ -1,5 +1,5 @@
 export type DownloadStatus = 'queued' | 'downloading' | 'paused' | 'completed' | 'error';
-export type DownloadCategory = 'video' | 'audio' | 'compressed' | 'document' | 'program' | 'image' | 'other';
+export type DownloadCategory = 'video' | 'audio' | 'compressed' | 'document' | 'program' | 'torrent' | 'image' | 'other';
 
 export interface DownloadSegment {
   id: number;
@@ -10,6 +10,7 @@ export interface DownloadSegment {
   total: number;
   status: 'pending' | 'downloading' | 'completed' | 'error';
   speed: number;
+  retries?: number;
 }
 
 export interface VideoFormatOption {
@@ -40,12 +41,26 @@ export interface DownloadTask {
   resumable: boolean;
   isHls?: boolean;
   isVideoStream?: boolean;
+  isTorrent?: boolean;
+  torrentPeers?: number;
+  torrentProgress?: number;
   quality?: string;
   formatId?: string;
   thumbnailUrl?: string;
   description?: string;
   lastTry?: string;
   logs?: string[];
+  queueName?: string;
+  priority?: number;
+}
+
+export interface QueueSchedule {
+  enabled: boolean;
+  startHour: number;
+  startMinute: number;
+  stopHour: number;
+  stopMinute: number;
+  autoShutdownOnComplete?: boolean;
 }
 
 export interface AppSettings {
@@ -58,6 +73,8 @@ export interface AppSettings {
   enableClipboardMonitor: boolean;
   serverPort: number;
   hasCompletedWelcome?: boolean;
+  schedule?: QueueSchedule;
+  autoShutdownOnQueueComplete?: boolean;
 }
 
 declare global {
@@ -70,7 +87,9 @@ declare global {
         category?: DownloadCategory,
         headers?: Record<string, string>,
         quality?: string,
-        formatId?: string
+        formatId?: string,
+        queueName?: string,
+        priority?: number
       ) => Promise<DownloadTask>;
       pauseDownload: (id: string) => Promise<boolean>;
       stopDownload: (id: string) => Promise<boolean>;

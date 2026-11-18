@@ -327,7 +327,9 @@ export const DetailInspector: React.FC<Props> = ({
           </div>
           <div className="meta-pair full-span">
             <span className="meta-lbl">Resume capability:</span>
-            <span className="meta-val">Yes (Range Requests)</span>
+            <span className="meta-val">
+              {task.isTorrent ? `P2P BitTorrent Swarm (${task.torrentPeers || 0} peers connected)` : 'Yes (HTTP Multi-Range)'}
+            </span>
           </div>
         </div>
       </div>
