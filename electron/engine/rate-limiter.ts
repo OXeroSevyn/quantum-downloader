@@ -1,25 +1,23 @@
 /**
- * Token Bucket Rate Limiter for bandwidth throttling
+ * Token-bucket bandwidth limiter shared by all HTTP downloads.
+ * The bucket holds at most a quarter second of traffic, so the configured
+ * limit is respected even over short periods (no multi-megabyte bursts).
  */
 export class RateLimiter {
-  private capacity: number; // Max burst in bytes
-  private tokens: number;   // Current available tokens
-  private refillRate: number; // Bytes per second (0 = unlimited)
-  private lastRefillTime: number;
+  private capacity = 0;
+  private tokens = 0;
+  private refillRate = 0; // bytes per second, 0 = unlimited
+  private lastRefill = Date.now();
 
-  constructor(limitKBps: number = 0) {
-    this.refillRate = limitKBps > 0 ? limitKBps * 1024 : 0;
-    this.capacity = Math.max(this.refillRate * 2, 64 * 1024);
+  constructor(limitKBps = 0) {
+    this.setLimit(limitKBps);
     this.tokens = this.capacity;
-    this.lastRefillTime = Date.now();
   }
 
   public setLimit(limitKBps: number): void {
     this.refillRate = limitKBps > 0 ? limitKBps * 1024 : 0;
-    this.capacity = Math.max(this.refillRate * 2, 64 * 1024);
-    if (this.tokens > this.capacity) {
-      this.tokens = this.capacity;
-    }
+    this.capacity = Math.max(this.refillRate / 4, 16 * 1024);
+    this.tokens = Math.min(this.tokens, this.capacity);
   }
 
   public getLimitKBps(): number {
@@ -32,30 +30,22 @@ export class RateLimiter {
 
   private refill(): void {
     const now = Date.now();
-    const elapsedSeconds = (now - this.lastRefillTime) / 1000;
-    this.lastRefillTime = now;
-
-    if (this.refillRate > 0) {
-      this.tokens = Math.min(this.capacity, this.tokens + elapsedSeconds * this.refillRate);
-    } else {
-      this.tokens = this.capacity;
-    }
+    const elapsed = (now - this.lastRefill) / 1000;
+    this.lastRefill = now;
+    this.tokens = Math.min(this.capacity, this.tokens + elapsed * this.refillRate);
   }
 
   public async acquire(bytes: number): Promise<void> {
-    if (this.refillRate <= 0) return;
-
-    while (true) {
+    while (this.refillRate > 0) {
       this.refill();
-      if (this.tokens >= bytes) {
+      // Chunks larger than the bucket are allowed once it is full, leaving a debt
+      const needed = Math.min(bytes, this.capacity);
+      if (this.tokens >= needed) {
         this.tokens -= bytes;
         return;
       }
-
-      // Calculate how long to wait for tokens
-      const needed = bytes - this.tokens;
-      const waitMs = Math.min(Math.max(Math.ceil((needed / this.refillRate) * 1000), 10), 500);
-      await new Promise(resolve => setTimeout(resolve, waitMs));
+      const waitMs = Math.ceil(((needed - this.tokens) / this.refillRate) * 1000);
+      await new Promise((r) => setTimeout(r, Math.min(Math.max(waitMs, 5), 250)));
     }
   }
 }

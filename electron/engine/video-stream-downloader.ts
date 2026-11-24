@@ -1,35 +1,53 @@
-import { spawn, ChildProcess } from 'child_process';
+import { spawn, execFile, ChildProcess } from 'child_process';
 import path from 'path';
 import fs from 'fs';
-import { app } from 'electron';
-import { DownloadTask, VideoFormatOption } from './types';
+import { DownloadTask, VideoFormatOption, DownloadSegment } from './types';
 import { DownloaderEvents } from './segmented-downloader';
+import { getBinaryPath, getJsRuntime } from './binaries';
 
-export function getBinaryPath(binaryName: string): string {
-  const isWindows = process.platform === 'win32';
-  const cleanName = isWindows 
-    ? (binaryName.endsWith('.exe') ? binaryName : binaryName + '.exe')
-    : binaryName.replace(/\.exe$/i, '');
+export { getBinaryPath } from './binaries';
 
-  const isDev = process.env.NODE_ENV === 'development' || !app?.isPackaged;
-  if (isDev) {
-    const p1 = path.join(process.cwd(), 'bin', cleanName);
-    if (fs.existsSync(p1)) return p1;
-    return path.join(process.cwd(), 'bin', binaryName);
+const VISUAL_BARS = 16;
+
+function ytdlpBaseArgs(): { args: string[]; env: NodeJS.ProcessEnv } {
+  const args = ['--no-colors', '--no-playlist', '--encoding', 'utf-8'];
+  const runtime = getJsRuntime();
+  if (runtime) args.push('--js-runtimes', runtime.arg);
+  return { args, env: { ...process.env, PYTHONIOENCODING: 'utf-8', ...(runtime?.env || {}) } };
+}
+
+function killTree(proc: ChildProcess | null): void {
+  if (!proc || proc.pid === undefined) return;
+  if (process.platform === 'win32') {
+    // yt-dlp spawns ffmpeg; kill the whole tree so nothing keeps the file locked
+    execFile('taskkill', ['/pid', String(proc.pid), '/T', '/F'], { windowsHide: true }, () => {});
   } else {
-    const prodPath = path.join(process.resourcesPath, 'bin', cleanName);
-    if (fs.existsSync(prodPath)) return prodPath;
-    const fallbackProd = path.join(process.resourcesPath, 'bin', binaryName);
-    if (fs.existsSync(fallbackProd)) return fallbackProd;
-    return path.join(process.cwd(), 'bin', cleanName);
+    try {
+      proc.kill('SIGTERM');
+    } catch {
+      /* ignore */
+    }
   }
+}
+
+function unitMultiplier(unit: string | undefined): number {
+  const u = (unit || 'MiB').toUpperCase();
+  if (u.startsWith('G')) return 1024 ** 3;
+  if (u.startsWith('M')) return 1024 ** 2;
+  if (u.startsWith('K')) return 1024;
+  return 1;
 }
 
 export class VideoStreamDownloader {
   public task: DownloadTask;
   private events: DownloaderEvents;
-  private childProcess: ChildProcess | null = null;
-  private isPaused: boolean = false;
+  private child: ChildProcess | null = null;
+  private stopped = false;
+  private lastEmit = 0;
+  /** Sizes of the streams already finished in this run (video, then audio…) */
+  private finishedPhases: number[] = [];
+  private currentPhaseTotal = 0;
+  private finalPath: string | null = null;
 
   constructor(task: DownloadTask, events: DownloaderEvents) {
     this.task = task;
@@ -37,380 +55,318 @@ export class VideoStreamDownloader {
   }
 
   public static async probeVideoFormats(videoUrl: string): Promise<{ title: string; formats: VideoFormatOption[] }> {
-    const ytdlp = getBinaryPath('yt-dlp.exe');
-    if (!fs.existsSync(ytdlp)) {
-      throw new Error('yt-dlp engine not found at ' + ytdlp);
-    }
+    const ytdlp = getBinaryPath('yt-dlp');
+    if (!fs.existsSync(ytdlp)) throw new Error('The video engine (yt-dlp) is missing from this installation');
+    const { args, env } = ytdlpBaseArgs();
 
     return new Promise((resolve, reject) => {
-      const args = [
-        '-J',
-        '--no-playlist',
-        '--no-warnings',
-        '--skip-download',
-        '--js-runtimes', 'node',
-        videoUrl,
-      ];
-
-      const proc = spawn(ytdlp, args);
+      const proc = spawn(ytdlp, [...args, '-J', '--no-warnings', '--skip-download', videoUrl], { env, windowsHide: true });
       let stdout = '';
       let stderr = '';
-
-      proc.stdout.on('data', chunk => stdout += chunk);
-      proc.stderr.on('data', chunk => stderr += chunk);
-
+      const timer = setTimeout(() => {
+        killTree(proc);
+        reject(new Error('Timed out while reading video information'));
+      }, 60_000);
+      proc.stdout.on('data', (c) => (stdout += c));
+      proc.stderr.on('data', (c) => (stderr += c));
+      proc.on('error', (e) => {
+        clearTimeout(timer);
+        reject(e);
+      });
       proc.on('close', (code) => {
-        if (code !== 0) {
-          return reject(new Error(stderr || `Failed to probe video info (code ${code})`));
-        }
-
+        clearTimeout(timer);
+        if (code !== 0) return reject(new Error(lastYtdlpError(stderr) || `Could not read video information (code ${code})`));
         try {
           const info = JSON.parse(stdout);
-          const title = info.title || 'Video';
-          const formats = VideoStreamDownloader.parseFormats(info);
-          resolve({ title, formats });
+          resolve({ title: info.title || 'Video', formats: VideoStreamDownloader.parseFormats(info) });
         } catch (err: any) {
           reject(err);
         }
       });
-
-      proc.on('error', reject);
     });
   }
 
   private static parseFormats(info: any): VideoFormatOption[] {
-    const rawFormats: any[] = info.formats || [];
-    const availableHeights = new Set<number>();
+    const raw: any[] = info.formats || [];
+    const heights = Array.from(new Set(raw.filter((f) => f.height && f.vcodec !== 'none').map((f) => f.height as number))).sort(
+      (a, b) => b - a
+    );
+    const labels: Record<number, [string, string]> = {
+      2160: ['2160p 4K Ultra HD', '4K'],
+      1440: ['1440p 2K QHD', '2K'],
+      1080: ['1080p Full HD', '1080p'],
+      720: ['720p HD', '720p'],
+      480: ['480p', '480p'],
+      360: ['360p', '360p'],
+      240: ['240p', '240p'],
+    };
     const options: VideoFormatOption[] = [];
-
-    // Check available heights
-    for (const f of rawFormats) {
-      if (f.height && f.vcodec !== 'none') {
-        availableHeights.add(f.height);
-      }
+    for (const target of [2160, 1440, 1080, 720, 480, 360, 240]) {
+      const match = heights.find((h) => Math.abs(h - target) <= 20);
+      if (!match) continue;
+      const f = raw.find((r) => r.height === match && r.vcodec !== 'none');
+      const size = f?.filesize || f?.filesize_approx;
+      const [label, quality] = labels[target];
+      options.push({
+        formatId: `bv*[height<=${match}]+ba/b[height<=${match}]/bv*+ba/b`,
+        resolution: `${target}p`,
+        quality,
+        ext: 'mp4',
+        filesize: size,
+        label: `${label}${size ? ` · ~${(size / 1048576).toFixed(0)} MB` : ''}`,
+      });
     }
-
-    const targetHeights = [2160, 1440, 1080, 720, 480, 360, 240];
-    const sortedHeights = Array.from(availableHeights).sort((a, b) => b - a);
-
-    for (const target of targetHeights) {
-      // Find matching or closest height
-      const match = sortedHeights.find(h => h === target || (h >= target - 20 && h <= target + 20));
-      if (match) {
-        let label = `${target}p`;
-        let quality = `${target}p`;
-        if (target === 2160) { label = '2160p 4K UHD'; quality = '4K'; }
-        else if (target === 1440) { label = '1440p 2K QHD'; quality = '2K'; }
-        else if (target === 1080) { label = '1080p Full HD'; quality = '1080p'; }
-        else if (target === 720) { label = '720p HD'; quality = '720p'; }
-        else if (target === 480) { label = '480p Standard'; quality = '480p'; }
-        else if (target === 360) { label = '360p'; quality = '360p'; }
-        else if (target === 240) { label = '240p'; quality = '240p'; }
-
-        // Find format info for estimated size
-        const f = rawFormats.find(r => r.height === match && r.vcodec !== 'none');
-        const sizeBytes = f?.filesize || f?.filesize_approx;
-        const sizeText = sizeBytes ? ` ~${(sizeBytes / 1024 / 1024).toFixed(1)} MB` : '';
-
-        if (!options.some(o => o.resolution === `${target}p` || o.quality === quality)) {
-          options.push({
-            formatId: `bv*[height<=${match}]+ba/b[height<=${match}]/bv*+ba/b`,
-            resolution: `${target}p`,
-            quality,
-            ext: 'mp4',
-            filesize: sizeBytes,
-            label: `${label} (MP4)${sizeText}`,
-          });
-        }
-      }
+    if (options.length === 0) {
+      options.push({ formatId: 'bv*+ba/b', resolution: 'Best', quality: 'Best', ext: 'mp4', label: 'Best available quality' });
     }
-
-    // Always offer Audio Only (MP3)
-    options.push({
-      formatId: 'ba/b',
-      resolution: 'Audio',
-      quality: 'Audio MP3',
-      ext: 'mp3',
-      label: 'Audio Only (MP3 / High Quality)',
-    });
-
+    options.push({ formatId: 'ba/b', resolution: 'Audio', quality: 'Audio MP3', ext: 'mp3', label: 'Audio only (MP3)' });
     return options;
   }
 
   public async start(): Promise<void> {
-    this.isPaused = false;
-    this.task.status = 'downloading';
-    this.task.isVideoStream = true;
+    this.stopped = false;
+    const task = this.task;
+    task.status = 'downloading';
+    task.isVideoStream = true;
+    task.errorMessage = undefined;
+    this.finishedPhases = [];
+    this.currentPhaseTotal = 0;
+    this.finalPath = null;
 
-    const ytdlp = getBinaryPath('yt-dlp.exe');
-    const ffmpeg = getBinaryPath('ffmpeg.exe');
+    const ytdlp = getBinaryPath('yt-dlp');
+    if (!fs.existsSync(ytdlp)) return this.fail('The video engine (yt-dlp) is missing from this installation');
+    const ffmpeg = getBinaryPath('ffmpeg');
 
-    if (!fs.existsSync(ytdlp)) {
-      this.handleError(new Error(`yt-dlp core not found: ${ytdlp}`));
-      return;
+    const audioOnly =
+      task.quality === 'audio' || task.formatId === 'ba/b' || /audio/i.test(task.quality || '') || /\.mp3$/i.test(task.filename);
+
+    let format = task.formatId;
+    if (!format) {
+      if (audioOnly) format = 'ba/b';
+      else if (task.quality && /\d/.test(task.quality)) {
+        const h = parseInt(task.quality.replace(/\D/g, ''), 10) || 1080;
+        format = `bv*[height<=${h}]+ba/b[height<=${h}]/bv*+ba/b`;
+      } else format = 'bv*+ba/b';
     }
 
-    // Prepare format argument
-    let formatArg = this.task.formatId;
-    if (!formatArg) {
-      if (this.task.quality === 'audio') {
-        formatArg = 'ba/b';
-      } else if (this.task.quality) {
-        const height = parseInt(this.task.quality.replace(/\D/g, ''), 10) || 1080;
-        formatArg = `bv*[height<=${height}]+ba/b[height<=${height}]/bv*+ba/b`;
-      } else {
-        formatArg = 'bv*+ba/b';
-      }
-    }
+    const dir = path.dirname(task.filepath);
+    fs.mkdirSync(dir, { recursive: true });
+    // Let yt-dlp choose the extension; with an automatic name use the video's title.
+    const template = task.autoName
+      ? path.join(dir, '%(title).150B [%(id)s].%(ext)s')
+      : path.join(dir, path.parse(task.filename).name.replace(/%/g, '%%') + '.%(ext)s');
 
-    const args = [
-      '-f', formatArg,
+    const { args, env } = ytdlpBaseArgs();
+    args.push(
+      '-f', format,
       '--newline',
-      '--no-playlist',
-      '--no-colors',
-      '--js-runtimes', 'node',
-      '--concurrent-fragments', String(this.task.connections || 16),
-      '-o', this.task.filepath,
-    ];
+      '--progress',
+      '--no-mtime',
+      '--windows-filenames',
+      '--concurrent-fragments', String(Math.max(1, Math.min(task.connections || 8, 16))),
+      '--print', 'after_move:QD_FINAL:%(filepath)s',
+      '-o', template
+    );
+    if (fs.existsSync(ffmpeg)) args.push('--ffmpeg-location', ffmpeg);
+    const h = task.headers || {};
+    if (h['Cookie']) args.push('--add-header', `Cookie:${h['Cookie']}`);
+    if (h['Referer']) args.push('--referer', h['Referer']);
+    if (h['User-Agent']) args.push('--user-agent', h['User-Agent']);
+    if (audioOnly) args.push('-x', '--audio-format', 'mp3', '--audio-quality', '0');
+    else args.push('--merge-output-format', 'mp4');
+    args.push('--', task.url);
 
-    if (fs.existsSync(ffmpeg)) {
-      args.push('--ffmpeg-location', ffmpeg);
-    }
+    this.addLog('Starting video engine…');
+    if (task.segments.length === 0) this.updateVisualSegments(0);
 
-    if (this.task.headers?.['Cookie']) {
-      args.push('--add-header', `Cookie:${this.task.headers['Cookie']}`);
-    }
-    if (this.task.headers?.['Referer']) {
-      args.push('--referer', this.task.headers['Referer']);
-    }
-    if (this.task.headers?.['User-Agent']) {
-      args.push('--user-agent', this.task.headers['User-Agent']);
-    }
+    let stderr = '';
+    let stdoutBuf = '';
+    const child = spawn(ytdlp, args, { env, windowsHide: true });
+    this.child = child;
 
-    if (this.task.quality === 'audio' || this.task.filename.endsWith('.mp3')) {
-      args.push('-x', '--audio-format', 'mp3');
-    } else {
-      args.push('--merge-output-format', 'mp4');
-    }
-
-    args.push(this.task.url);
-
-    const numThreads = this.task.connections || 16;
-    // Initialize real segments
-    if (this.task.segments.length === 0) {
-      this.task.segments = Array.from({ length: numThreads }, (_, idx) => ({
-        id: idx,
-        startByte: idx * 1048576,
-        endByte: (idx + 1) * 1048576 - 1,
-        currentByte: idx * 1048576,
-        downloaded: 0,
-        total: 1048576,
-        status: 'pending',
-        speed: 0,
-      }));
-    }
-
-    this.addLog(`Spawning download worker via yt-dlp (${numThreads} threads)`);
-    this.addLog(`Target: ${this.task.url}`);
-
-    this.childProcess = spawn(ytdlp, args);
-
-    this.childProcess.stdout?.on('data', (data) => {
-      const text = data.toString();
-      this.parseProgress(text);
+    child.stdout?.on('data', (data: Buffer) => {
+      stdoutBuf += data.toString('utf8');
+      const lines = stdoutBuf.split(/\r?\n/);
+      stdoutBuf = lines.pop() || '';
+      for (const line of lines) this.handleLine(line);
     });
-
-    let capturedStderr = '';
-
-    this.childProcess.stderr?.on('data', (data) => {
-      const errText = data.toString();
-      capturedStderr += errText;
-      if (!errText.includes('WARNING')) {
-        console.warn('[yt-dlp stderr]:', errText.trim());
-      }
+    child.stderr?.on('data', (data: Buffer) => {
+      stderr += data.toString('utf8');
+      if (stderr.length > 20000) stderr = stderr.slice(-20000);
     });
-
-    this.childProcess.on('close', (code) => {
-      this.childProcess = null;
-      if (this.isPaused) return;
-
-      if (code === 0) {
-        // Query actual disk file to get the exact real downloaded size!
-        let actualFile = this.task.filepath;
-        if (!fs.existsSync(actualFile)) {
-          const parsed = path.parse(actualFile);
-          const candidates = ['.mp4', '.mkv', '.webm', '.mp3', '.m4a'];
-          for (const ext of candidates) {
-            const testP = path.join(parsed.dir, parsed.name + ext);
-            if (fs.existsSync(testP)) {
-              actualFile = testP;
-              break;
-            }
-          }
-        }
-
-        if (fs.existsSync(actualFile)) {
-          const stat = fs.statSync(actualFile);
-          this.task.filepath = actualFile;
-          this.task.filename = path.basename(actualFile);
-          this.task.totalBytes = stat.size;
-          this.task.downloadedBytes = stat.size;
-
-          const chunkSize = Math.max(1, Math.floor(stat.size / numThreads));
-          this.task.segments = Array.from({ length: numThreads }, (_, idx) => {
-            const start = idx * chunkSize;
-            const end = idx === numThreads - 1 ? stat.size - 1 : (idx + 1) * chunkSize - 1;
-            const total = end - start + 1;
-            return {
-              id: idx,
-              startByte: start,
-              endByte: end,
-              currentByte: end,
-              downloaded: total,
-              total,
-              status: 'completed' as const,
-              speed: 0,
-            };
-          });
-        } else {
-          this.task.segments.forEach(s => {
-            s.status = 'completed';
-            s.downloaded = s.total;
-          });
-        }
-
-        const mbSize = (this.task.totalBytes / (1024 * 1024)).toFixed(2);
-        this.addLog(`Streams merged & verified (${mbSize} MB). Download completed!`);
-        this.task.status = 'completed';
-        this.task.completedAt = Date.now();
-        this.task.speed = 0;
-        this.events.onComplete(this.task);
-      } else {
-        const errorLines = capturedStderr.split('\n')
-          .map(l => l.trim())
-          .filter(l => l.startsWith('ERROR:') || l.includes('Error:'));
-        const friendlyError = errorLines.length > 0 
-          ? errorLines[errorLines.length - 1].replace(/^ERROR:\s*/i, '')
-          : `Download exited with code ${code}`;
-        this.addLog(`Error: ${friendlyError}`);
-        this.handleError(new Error(friendlyError));
-      }
+    child.on('error', (err) => {
+      if (this.child !== child) return;
+      this.child = null;
+      if (!this.stopped) this.fail(err.message);
     });
-
-    this.childProcess.on('error', (err) => {
-      if (this.isPaused) return;
-      this.handleError(err);
+    child.on('close', (code) => {
+      if (this.child !== child) return;
+      this.child = null;
+      if (stdoutBuf) this.handleLine(stdoutBuf);
+      if (this.stopped) return;
+      if (code === 0) this.complete();
+      else this.fail(lastYtdlpError(stderr) || `Video download failed (code ${code})`);
     });
   }
 
   public pause(): void {
-    this.isPaused = true;
+    this.stopped = true;
+    const c = this.child;
+    this.child = null;
+    killTree(c);
     this.task.status = 'paused';
     this.task.speed = 0;
-    if (this.childProcess) {
-      try {
-        this.childProcess.kill();
-      } catch (e) {}
-      this.childProcess = null;
-    }
-    this.events.onProgress(this.task);
   }
 
   public cancel(): void {
     this.pause();
-    try {
-      if (fs.existsSync(this.task.filepath)) {
-        fs.unlinkSync(this.task.filepath);
+    const task = this.task;
+    const dir = path.dirname(task.filepath);
+    const base = path.parse(task.filepath).name;
+    // Give taskkill a moment to release file locks, then remove the partial files.
+    setTimeout(() => {
+      try {
+        for (const f of fs.readdirSync(dir)) {
+          if (f.startsWith(base + '.') && /\.(part|ytdl|temp)$|\.part-Frag\d+|\.f\d+\./i.test(f)) {
+            fs.rmSync(path.join(dir, f), { force: true });
+          }
+        }
+      } catch {
+        /* ignore */
       }
-    } catch (e) {}
+    }, 800);
+  }
+
+  // ───────────────────────────── output parsing ─────────────────────────────
+
+  private handleLine(line: string): void {
+    const task = this.task;
+    const text = line.trim();
+    if (!text) return;
+
+    if (text.startsWith('QD_FINAL:')) {
+      this.finalPath = text.slice('QD_FINAL:'.length).trim();
+      return;
+    }
+    const dest = text.match(/^\[download\] Destination:\s*(.+)$/);
+    if (dest) {
+      if (this.currentPhaseTotal > 0) this.finishedPhases.push(this.currentPhaseTotal);
+      this.currentPhaseTotal = 0;
+      const p = dest[1].trim();
+      const clean = path.basename(p).replace(/\.f\d+(?=\.\w+$)/, '');
+      if (task.autoName) {
+        task.filename = clean;
+        task.filepath = path.join(path.dirname(p), clean);
+      }
+      this.addLog(`Downloading stream ${this.finishedPhases.length + 1}`);
+      return;
+    }
+    if (text.startsWith('[Merger]')) {
+      this.addLog('Merging video and audio…');
+      return this.emit(true);
+    }
+    if (text.startsWith('[ExtractAudio]')) {
+      this.addLog('Converting audio to MP3…');
+      return this.emit(true);
+    }
+
+    const m = text.match(
+      /^\[download\]\s+(\d+(?:\.\d+)?)%\s+of\s+~?\s*(\d+(?:\.\d+)?)\s*([KMGT]?i?B)(?:\s+at\s+~?\s*(\d+(?:\.\d+)?)\s*([KMGT]?i?B)\/s)?/i
+    );
+    if (!m) return;
+    const percent = Math.min(100, parseFloat(m[1]));
+    const size = Math.round(parseFloat(m[2]) * unitMultiplier(m[3]));
+    this.currentPhaseTotal = Math.max(this.currentPhaseTotal, size);
+    const doneBefore = this.finishedPhases.reduce((a, b) => a + b, 0);
+    task.totalBytes = Math.max(task.totalBytes || 0, doneBefore + this.currentPhaseTotal);
+    task.downloadedBytes = Math.min(task.totalBytes, doneBefore + Math.round((percent / 100) * this.currentPhaseTotal));
+    task.speed = m[4] ? Math.round(parseFloat(m[4]) * unitMultiplier(m[5])) : 0;
+    this.updateVisualSegments(task.totalBytes ? task.downloadedBytes / task.totalBytes : 0);
+    this.emit();
+  }
+
+  private emit(force = false): void {
+    const now = Date.now();
+    if (!force && now - this.lastEmit < 400) return;
+    this.lastEmit = now;
+    this.events.onProgress(this.task);
+  }
+
+  private updateVisualSegments(fraction: number): void {
+    const total = this.task.totalBytes || VISUAL_BARS;
+    const per = total / VISUAL_BARS;
+    const doneBars = fraction * VISUAL_BARS;
+    const segs: DownloadSegment[] = [];
+    for (let i = 0; i < VISUAL_BARS; i++) {
+      const start = Math.floor(i * per);
+      const end = Math.floor((i + 1) * per) - 1;
+      const segTotal = Math.max(1, end - start + 1);
+      const f = Math.max(0, Math.min(1, doneBars - i));
+      const downloaded = Math.round(segTotal * f);
+      segs.push({
+        id: i,
+        startByte: start,
+        endByte: end,
+        currentByte: start + downloaded,
+        downloaded,
+        total: segTotal,
+        status: f >= 1 ? 'completed' : f > 0 ? 'downloading' : 'pending',
+        speed: f > 0 && f < 1 ? this.task.speed : 0,
+      });
+    }
+    this.task.segments = segs;
+  }
+
+  private complete(): void {
+    const task = this.task;
+    let file = this.finalPath && fs.existsSync(this.finalPath) ? this.finalPath : task.filepath;
+    if (!fs.existsSync(file)) {
+      const parsed = path.parse(file);
+      for (const ext of ['.mp4', '.mkv', '.webm', '.mp3', '.m4a', '.opus']) {
+        const candidate = path.join(parsed.dir, parsed.name + ext);
+        if (fs.existsSync(candidate)) {
+          file = candidate;
+          break;
+        }
+      }
+    }
+    if (fs.existsSync(file)) {
+      const size = fs.statSync(file).size;
+      task.filepath = file;
+      task.filename = path.basename(file);
+      task.totalBytes = task.downloadedBytes = size;
+    }
+    this.stopped = true;
+    this.updateVisualSegments(1);
+    task.status = 'completed';
+    task.completedAt = Date.now();
+    task.speed = 0;
+    this.addLog('Finished');
+    this.events.onComplete(task);
+  }
+
+  private fail(message: string): void {
+    this.stopped = true;
+    this.task.status = 'error';
+    this.task.errorMessage = message;
+    this.task.speed = 0;
+    this.addLog(`Error: ${message}`);
+    this.events.onError(this.task, new Error(message));
   }
 
   private addLog(message: string): void {
-    const time = new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
-    if (!this.task.logs) this.task.logs = [];
-    this.task.logs.push(`[${time}] ${message}`);
-    if (this.task.logs.length > 50) this.task.logs.shift();
+    const time = new Date().toLocaleTimeString('en-GB', { hour12: false });
+    const logs = this.task.logs || [];
+    logs.push(`[${time}] ${message}`);
+    this.task.logs = logs.slice(-50);
   }
+}
 
-  private parseProgress(output: string): void {
-    if (output.includes('[Merger]')) {
-      this.addLog('Merging audio and video streams via FFmpeg...');
-    } else if (output.includes('[ExtractAudio]')) {
-      this.addLog('Extracting and encoding high-fidelity audio...');
-    } else if (output.includes('[download] Destination:')) {
-      const destMatch = output.match(/Destination:\s*(.+)/);
-      if (destMatch && destMatch[1]) {
-        this.addLog(`Stream chunk acquired: ${path.basename(destMatch[1].trim())}`);
-      }
-    }
-
-    const match = output.match(/\[download\]\s+(\d+\.?\d*)%\s+of\s+~?(\d+\.?\d*)([KMG]iB)?\s+at\s+~?(\d+\.?\d*)([KMG]iB\/s)?/i);
-    if (match) {
-      const percent = parseFloat(match[1]);
-      const sizeVal = parseFloat(match[2]);
-      const sizeUnit = match[3] || 'MiB';
-      const speedVal = parseFloat(match[4]);
-      const speedUnit = match[5] || 'MiB/s';
-
-      let multiplier = 1024 * 1024;
-      if (sizeUnit.includes('K')) multiplier = 1024;
-      if (sizeUnit.includes('G')) multiplier = 1024 * 1024 * 1024;
-
-      const calcSize = Math.round(sizeVal * multiplier);
-      if (calcSize > this.task.totalBytes) {
-        this.task.totalBytes = calcSize;
-      }
-      this.task.downloadedBytes = Math.round((percent / 100) * this.task.totalBytes);
-
-      let speedMultiplier = 1024 * 1024;
-      if (speedUnit.includes('K')) speedMultiplier = 1024;
-      if (speedUnit.includes('G')) speedMultiplier = 1024 * 1024 * 1024;
-      this.task.speed = Math.round(speedVal * speedMultiplier);
-
-      // Distribute visually across segment blocks
-      const numThreads = this.task.connections || 16;
-      const chunkSize = Math.max(1, Math.floor(this.task.totalBytes / numThreads));
-      const completedSegments = Math.floor((percent / 100) * numThreads);
-
-      this.task.segments = Array.from({ length: numThreads }, (_, idx) => {
-        const start = idx * chunkSize;
-        const end = idx === numThreads - 1 ? this.task.totalBytes - 1 : (idx + 1) * chunkSize - 1;
-        const segTotal = Math.max(1, end - start + 1);
-        let downloaded = 0;
-        let status: 'completed' | 'downloading' | 'pending' = 'pending';
-
-        if (idx < completedSegments) {
-          downloaded = segTotal;
-          status = 'completed';
-        } else if (idx === completedSegments) {
-          const fraction = (percent % (100 / numThreads)) / (100 / numThreads);
-          downloaded = Math.round(segTotal * fraction);
-          status = 'downloading';
-        } else {
-          downloaded = 0;
-          status = 'pending';
-        }
-
-        return {
-          id: idx,
-          startByte: start,
-          endByte: end,
-          currentByte: start + downloaded,
-          downloaded,
-          total: segTotal,
-          status,
-          speed: status === 'downloading' ? this.task.speed : 0,
-        };
-      });
-
-      this.events.onProgress(this.task);
-    }
-  }
-
-  private handleError(err: Error): void {
-    this.task.status = 'error';
-    this.task.errorMessage = err.message || 'Stream download error';
-    this.task.speed = 0;
-    this.events.onError(this.task, err);
-  }
+function lastYtdlpError(stderr: string): string {
+  const lines = stderr
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => /^ERROR:/i.test(l));
+  const last = lines[lines.length - 1];
+  return last ? last.replace(/^ERROR:\s*(\[[^\]]+\]\s*)?/i, '').slice(0, 300) : '';
 }

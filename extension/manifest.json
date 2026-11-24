@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Quantum Downloader - Universal Video & Download Integration",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "description": "Multi-connection download acceleration and video sniffer integration for Quantum Downloader",
   "permissions": [
     "downloads",

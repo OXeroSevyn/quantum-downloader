@@ -19,7 +19,6 @@ export interface VideoFormatOption {
   quality: string;
   ext: string;
   filesize?: number;
-  filesizeText?: string;
   label: string;
 }
 
@@ -47,11 +46,12 @@ export interface DownloadTask {
   quality?: string;
   formatId?: string;
   thumbnailUrl?: string;
-  description?: string;
   lastTry?: string;
   logs?: string[];
   queueName?: string;
   priority?: number;
+  hlsIndex?: number;
+  hlsCount?: number;
 }
 
 export interface QueueSchedule {
@@ -68,7 +68,7 @@ export interface AppSettings {
   defaultConnections: number;
   maxActiveDownloads: number;
   speedLimitKBps: number;
-  theme: 'light' | 'dark' | string;
+  theme: 'light' | 'dark' | 'system' | string;
   autoResumeOnStartup: boolean;
   enableClipboardMonitor: boolean;
   serverPort: number;
@@ -77,37 +77,54 @@ export interface AppSettings {
   autoShutdownOnQueueComplete?: boolean;
 }
 
+export interface NewDownloadRequest {
+  url: string;
+  filename?: string;
+  category?: DownloadCategory;
+  headers?: Record<string, string>;
+  quality?: string;
+  formatId?: string;
+  priority?: number;
+  directory?: string;
+}
+
+export type AddResult = { ok: true; task: DownloadTask } | { ok: false; error: string };
+
+export interface QuantumApi {
+  getDownloads: () => Promise<DownloadTask[]>;
+  addDownload: (opts: NewDownloadRequest) => Promise<AddResult>;
+  probeFormats: (url: string) => Promise<{ ok: boolean; title?: string; formats?: VideoFormatOption[]; error?: string }>;
+  pauseDownload: (id: string) => Promise<void>;
+  stopDownload: (id: string) => Promise<void>;
+  resumeDownload: (id: string) => Promise<void>;
+  restartDownload: (id: string) => Promise<void>;
+  cancelDownload: (id: string) => Promise<void>;
+  deleteDownload: (id: string, deleteFileFromDisk: boolean) => Promise<void>;
+  pauseAll: () => Promise<void>;
+  resumeAll: () => Promise<void>;
+  clearCompleted: () => Promise<void>;
+  cancelShutdown: () => Promise<boolean>;
+  openFile: (id: string) => Promise<string>;
+  openFolder: (id: string) => Promise<void>;
+  openDownloadDir: () => Promise<string>;
+  openExternal: (url: string) => Promise<void>;
+  openExtensionFolder: () => Promise<string>;
+  getSettings: () => Promise<AppSettings>;
+  saveSettings: (settings: Partial<AppSettings>) => Promise<AppSettings>;
+  getAppInfo: () => Promise<{ version: string; platform: string; downloadsDir: string; bridgeOnline?: boolean }>;
+  selectDownloadFolder: () => Promise<string | null>;
+  minimizeWindow: () => Promise<void>;
+  maximizeWindow: () => Promise<void>;
+  closeWindow: () => Promise<void>;
+  closeDialog: () => Promise<void>;
+  showMainWindow: () => Promise<void>;
+  getDialogData: () => Promise<Partial<NewDownloadRequest> | null>;
+  platform: string;
+  on: (channel: string, callback: (...args: any[]) => void) => () => void;
+}
+
 declare global {
   interface Window {
-    quantumApi?: {
-      getDownloads: () => Promise<DownloadTask[]>;
-      addDownload: (
-        url: string,
-        filename?: string,
-        category?: DownloadCategory,
-        headers?: Record<string, string>,
-        quality?: string,
-        formatId?: string,
-        queueName?: string,
-        priority?: number
-      ) => Promise<DownloadTask>;
-      pauseDownload: (id: string) => Promise<boolean>;
-      stopDownload: (id: string) => Promise<boolean>;
-      resumeDownload: (id: string) => Promise<boolean>;
-      cancelDownload: (id: string) => Promise<boolean>;
-      deleteDownload: (id: string, deleteFileFromDisk: boolean) => Promise<boolean>;
-      openFile: (id: string) => Promise<boolean>;
-      openFolder: (id: string) => Promise<boolean>;
-      getSettings: () => Promise<AppSettings>;
-      saveSettings: (settings: Partial<AppSettings>) => Promise<AppSettings>;
-      selectDownloadFolder: () => Promise<string | null>;
-      minimizeWindow: () => Promise<void>;
-      maximizeWindow: () => Promise<void>;
-      closeWindow: () => Promise<void>;
-      closeDialog: () => Promise<void>;
-      showMainWindow: () => Promise<void>;
-      getDialogData: () => Promise<any>;
-      on: (channel: string, callback: (...args: any[]) => void) => () => void;
-    };
+    quantumApi?: QuantumApi;
   }
 }

@@ -62,7 +62,7 @@ export class StorageManager {
 
   public saveSettings(settings: AppSettings): void {
     try {
-      fs.writeFileSync(this.configPath, JSON.stringify(settings, null, 2), 'utf-8');
+      writeAtomic(this.configPath, JSON.stringify(settings, null, 2));
     } catch (err) {
       console.error('Error saving settings:', err);
     }
@@ -73,11 +73,11 @@ export class StorageManager {
       if (fs.existsSync(this.downloadsPath)) {
         const raw = fs.readFileSync(this.downloadsPath, 'utf-8');
         const parsed: DownloadTask[] = JSON.parse(raw);
-        // Reset speed and downloading status to paused on boot
-        return parsed.map((task) => ({
+        if (!Array.isArray(parsed)) return [];
+        // Speeds are transient; the manager decides whether interrupted work resumes
+        return parsed.filter((t) => t && t.id && t.url).map((task) => ({
           ...task,
           speed: 0,
-          status: task.status === 'downloading' ? 'paused' : task.status,
           segments: task.segments ? task.segments.map(s => ({
             ...s,
             speed: 0,
@@ -94,13 +94,17 @@ export class StorageManager {
   public saveDownloads(downloads: DownloadTask[]): void {
     try {
       // Don't save transient internal objects
-      const serialized = downloads.map(d => ({
-        ...d,
-        speed: d.status === 'downloading' ? d.speed : 0,
-      }));
-      fs.writeFileSync(this.downloadsPath, JSON.stringify(serialized, null, 2), 'utf-8');
+      const serialized = downloads.map((d) => ({ ...d, speed: 0 }));
+      writeAtomic(this.downloadsPath, JSON.stringify(serialized));
     } catch (err) {
       console.error('Error saving downloads:', err);
     }
   }
+}
+
+/** Write to a temp file then rename, so a crash never leaves half-written JSON. */
+function writeAtomic(file: string, data: string): void {
+  const tmp = `${file}.tmp`;
+  fs.writeFileSync(tmp, data, 'utf-8');
+  fs.renameSync(tmp, file);
 }

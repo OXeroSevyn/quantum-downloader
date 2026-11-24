@@ -4,7 +4,7 @@ A fast, multi-segment download manager and video sniffer for desktop, built with
 
 **Made by [Subham Dey](https://github.com/OXeroSevyn)**
 
-![Platform](https://img.shields.io/badge/platform-Windows-blue.svg) ![License](https://img.shields.io/badge/license-MIT-green.svg) ![Version](https://img.shields.io/badge/version-1.1.0-orange.svg)
+![Platform](https://img.shields.io/badge/platform-Windows-blue.svg) ![License](https://img.shields.io/badge/license-MIT-green.svg) ![Version](https://img.shields.io/badge/version-1.2.0-orange.svg)
 
 [![Download Installer](https://img.shields.io/badge/Download-Installer-blue.svg)](https://github.com/OXeroSevyn/quantum-downloader/releases/latest) [![Download Portable](https://img.shields.io/badge/Download-Portable-green.svg)](https://github.com/OXeroSevyn/quantum-downloader/releases/latest)
 
@@ -12,14 +12,7 @@ A fast, multi-segment download manager and video sniffer for desktop, built with
 
 ## 📸 Screenshots & Demo
 
-| Feature | Screenshot |
-|---------|------------|
-| Main UI | ![Main UI](assets/screenshot-main.png) |
-| Video Sniffer | ![Video Sniffer](assets/screenshot-sniffer.png) |
-
-**Live demo:**
-
-![Demo GIF](assets/demo.gif)
+![Main UI](assets/screenshot-main.png)
 
 ---
 
@@ -48,6 +41,19 @@ A fast, multi-segment download manager and video sniffer for desktop, built with
 
 ---
 
+## 🆕 What's new in 1.2.0
+
+- **New interface**: redesigned main window, dialogs and a five-step introduction, with light and dark themes.
+- **Torrents work again**: magnet and `.torrent` links failed to load in 1.1.0.
+- **Safer browser bridge**: only the extension (and programs on this computer) can send downloads; websites are blocked, and file names can no longer point outside your download folder.
+- **No more corrupted files**: existing files are never overwritten; a new download gets a free name like `file (1).zip`.
+- **Streams (.m3u8)**: failed parts are retried instead of hanging, AES-128 encrypted streams are supported, paused streams resume, and finished streams are saved as MP4.
+- **Accurate progress**: splitting work between connections no longer downloads data twice or shows more than 100%.
+- **Queue fixes**: several downloads start together, unfinished downloads continue on startup, and auto-shutdown only happens after the queue finishes (with a cancel button).
+- **Speed limit** now holds steady instead of allowing large bursts.
+
+---
+
 ## 💻 Platform Support
 
 | Platform | Status |
@@ -62,8 +68,8 @@ A fast, multi-segment download manager and video sniffer for desktop, built with
 
 1. Go to the [Releases page](https://github.com/OXeroSevyn/quantum-downloader/releases/latest).
 2. Download one of the following:
-   - **Installer**: `Quantum Downloader Setup 1.0.0.exe` (adds a desktop shortcut and Start Menu entry).
-   - **Portable**: `Quantum Downloader 1.0.0.exe` (no installation, just double-click to run).
+   - **Installer**: `Quantum Downloader Setup 1.2.0.exe` (adds a desktop shortcut and Start Menu entry).
+   - **Portable**: `Quantum Downloader 1.2.0 Portable.exe` (no installation, just double-click to run).
 3. Run it.
 
 > **Windows SmartScreen:** The installer is not code-signed yet, so SmartScreen may show a warning. Only download from the official Releases page. If the warning appears, click **More info → Run anyway**.
@@ -71,8 +77,8 @@ A fast, multi-segment download manager and video sniffer for desktop, built with
 **Checksums (SHA-256):**
 
 ```text
-Quantum Downloader Setup 1.1.0.exe : 6B50CF38A4711E497782E02FF4ADF94A4B102AB5FE610C879DBEF69E6E3BB08B
-Quantum Downloader 1.1.0.exe       : 7F3BBC9400E852845239924C262DD927C2ABB0650ACFA3A8FF8DB8BB2DE38978
+Quantum Downloader Setup 1.2.0.exe    : 73852A18BE6095F36339F5617B9C069120E725B14C27303EB410572D95C5B5E1
+Quantum Downloader 1.2.0 Portable.exe : D1B4AD8046D5BA4DC916570534C05DDB5389672544767AF66F05C5A462C81C61
 ```
 
 ---
@@ -132,6 +138,12 @@ npm run build:renderer
 # Compile the Electron main process (TypeScript)
 npm run build:electron
 
+# Build the Windows installer and portable app
+npm run dist
+
+# Run the download-engine tests
+npm test
+
 # Optional: Build a macOS DMG (requires a macOS machine)
 npm run build:mac
 ```
@@ -140,8 +152,8 @@ Windows build output goes to the `dist-package` folder:
 
 | Artifact | Path |
 |----------|------|
-| Installer | `dist-package\Quantum Downloader Setup 1.0.0.exe` |
-| Portable | `dist-package\Quantum Downloader 1.0.0.exe` |
+| Installer | `dist-package\Quantum Downloader Setup 1.2.0.exe` |
+| Portable | `dist-package\Quantum Downloader 1.2.0 Portable.exe` |
 | Unpacked app | `dist-package\win-unpacked\Quantum Downloader.exe` |
 
 ---
@@ -176,7 +188,8 @@ Licensed under the **MIT License**. See the `LICENSE` file for details. The copy
 
 ## 🙏 Acknowledgments
 
-- **ffmpeg-static**: cross-platform media utilities.
+- **yt-dlp** and **FFmpeg**: video page downloads and stream conversion.
+- **WebTorrent**: torrent and magnet support.
 - **Lucide React**: icon set used throughout the UI.
 - **ws**: WebSocket library for real-time communication.
 - **Electron**: core framework powering the desktop app.

@@ -1,45 +1,85 @@
 import path from 'path';
-import { shell, BrowserWindow } from 'electron';
+import fs from 'fs';
+import { shell, BrowserWindow, Notification } from 'electron';
 import { StorageManager } from './storage';
 import { DownloadTask, AppSettings, DownloadCategory } from './types';
-import { SegmentedDownloader } from './segmented-downloader';
+import { SegmentedDownloader, DownloaderEvents, detectCategory } from './segmented-downloader';
 import { HlsDownloader } from './hls-downloader';
 import { VideoStreamDownloader } from './video-stream-downloader';
 import { TorrentDownloader } from './torrent-downloader';
 import { RateLimiter } from './rate-limiter';
 import { SchedulerManager } from './scheduler';
+import { sanitizeFilename, uniqueFilePath, safeUnlink, isInsideDir } from './file-utils';
+
+type Worker = SegmentedDownloader | HlsDownloader | VideoStreamDownloader | TorrentDownloader;
+
+export interface AddTaskOptions {
+  url: string;
+  filename?: string;
+  category?: DownloadCategory;
+  headers?: Record<string, string>;
+  quality?: string;
+  formatId?: string;
+  queueName?: string;
+  priority?: number;
+  /** Folder to save into; defaults to the configured download folder. */
+  directory?: string;
+}
+
+const VIDEO_HOSTS =
+  /(^|\.)(youtube\.com|youtu\.be|vimeo\.com|dailymotion\.com|tiktok\.com|twitter\.com|x\.com|instagram\.com|twitch\.tv|soundcloud\.com|facebook\.com|fb\.watch|reddit\.com|bilibili\.com)$/i;
 
 export class DownloadManager {
   private storage: StorageManager;
   private tasks: Map<string, DownloadTask> = new Map();
-  private activeWorkers: Map<string, SegmentedDownloader | HlsDownloader | VideoStreamDownloader | TorrentDownloader> = new Map();
+  private workers: Map<string, Worker> = new Map();
   private settings: AppSettings;
   private mainWindow: BrowserWindow | null = null;
   private rateLimiter: RateLimiter;
   private scheduler: SchedulerManager;
+  private bulk = false;
+  private persistTimer: NodeJS.Timeout | null = null;
+  private shutdownPending = false;
 
   constructor(storage: StorageManager) {
     this.storage = storage;
     this.settings = this.storage.getSettings();
-
-    // Initialize global bandwidth rate limiter
     this.rateLimiter = new RateLimiter(this.settings.speedLimitKBps || 0);
-
-    // Initialize schedule manager
     this.scheduler = new SchedulerManager(
-      () => this.resumeAllQueued(),
-      () => this.pauseAllDownloading()
+      () => this.resumeAll(),
+      () => this.pauseAll()
     );
-    this.scheduler.setSchedule(this.settings.schedule);
 
-    // Load persisted tasks
-    const saved = this.storage.getDownloads();
-    for (const t of saved) {
+    const autoResume = this.settings.autoResumeOnStartup !== false;
+    for (const t of this.storage.getDownloads()) {
+      if (t.status === 'downloading' || t.status === 'queued') t.status = autoResume ? 'queued' : 'paused';
       this.tasks.set(t.id, t);
     }
   }
 
-  public setMainWindow(win: BrowserWindow) {
+  /** Called once the UI exists: starts queued work and the scheduler. */
+  public init(): void {
+    this.scheduler.setSchedule(this.settings.schedule);
+    this.checkQueue();
+    // Save progress regularly so a crash loses at most a few seconds
+    this.persistTimer = setInterval(() => {
+      if (this.workers.size > 0) this.persist();
+    }, 5000);
+  }
+
+  public shutdown(): void {
+    if (this.persistTimer) clearInterval(this.persistTimer);
+    this.scheduler.destroy();
+    for (const [id, worker] of this.workers) {
+      worker.pause();
+      const t = this.tasks.get(id);
+      if (t) t.status = 'queued'; // resumes next launch when auto-resume is on
+    }
+    this.workers.clear();
+    this.persist();
+  }
+
+  public setMainWindow(win: BrowserWindow | null) {
     this.mainWindow = win;
   }
 
@@ -47,114 +87,96 @@ export class DownloadManager {
     return this.settings;
   }
 
-  public updateSettings(newSettings: Partial<AppSettings>): AppSettings {
-    this.settings = { ...this.settings, ...newSettings };
-    
-    // Update rate limiter
-    if (newSettings.speedLimitKBps !== undefined) {
-      this.rateLimiter.setLimit(this.settings.speedLimitKBps || 0);
-    }
+  public updateSettings(patch: Partial<AppSettings>): AppSettings {
+    const next: AppSettings = { ...this.settings, ...patch };
+    next.defaultConnections = clamp(Number(next.defaultConnections) || 16, 1, 32);
+    next.maxActiveDownloads = clamp(Number(next.maxActiveDownloads) || 4, 1, 16);
+    next.speedLimitKBps = Math.max(0, Number(next.speedLimitKBps) || 0);
+    if (!next.downloadDir || !path.isAbsolute(next.downloadDir)) next.downloadDir = this.settings.downloadDir;
+    this.settings = next;
 
-    // Update scheduler
-    if (newSettings.schedule !== undefined) {
-      this.scheduler.setSchedule(this.settings.schedule);
-    }
-
-    this.storage.saveSettings(this.settings);
-    return this.settings;
+    if (patch.speedLimitKBps !== undefined) this.rateLimiter.setLimit(next.speedLimitKBps);
+    if (patch.schedule !== undefined) this.scheduler.setSchedule(next.schedule);
+    this.storage.saveSettings(next);
+    if (patch.maxActiveDownloads !== undefined) this.checkQueue();
+    return next;
   }
 
   public getAllTasks(): DownloadTask[] {
     return Array.from(this.tasks.values()).sort((a, b) => {
-      // Sort by priority (descending), then by createdAt (descending)
-      const pA = a.priority || 0;
-      const pB = b.priority || 0;
-      if (pA !== pB) return pB - pA;
-      return b.createdAt - a.createdAt;
+      const p = (b.priority || 0) - (a.priority || 0);
+      return p !== 0 ? p : b.createdAt - a.createdAt;
     });
   }
 
-  public addTask(
-    url: string,
-    customFilename?: string,
-    category?: DownloadCategory,
-    headers?: Record<string, string>,
-    quality?: string,
-    formatId?: string,
-    queueName?: string,
-    priority?: number
-  ): DownloadTask {
-    const id = 'qd_' + Date.now().toString(36) + '_' + Math.random().toString(36).substring(2, 6);
-    
-    // Normalize URL
-    let cleanUrl = url.trim();
+  public addTask(opts: AddTaskOptions): DownloadTask {
+    let url = String(opts.url || '').trim();
+    if (!url) throw new Error('Please enter a download link');
 
-    // Detect BitTorrent / Magnet links
-    const isMagnet = cleanUrl.startsWith('magnet:?');
-    const isTorrentFile = cleanUrl.endsWith('.torrent') || cleanUrl.includes('.torrent?');
-    const isTorrent = isMagnet || isTorrentFile;
-
-    if (!isMagnet && !/^https?:\/\//i.test(cleanUrl)) {
-      cleanUrl = 'https://' + cleanUrl;
-    }
-
-    // Check if this is an explicit streaming video platform
-    const isKnownVideoHost = 
-      /youtube\.com|youtu\.be|vimeo\.com|dailymotion\.com|tiktok\.com|twitter\.com|x\.com|instagram\.com|twitch\.tv|soundcloud\.com/i.test(cleanUrl);
-    const hasExplicitVideoFormat = Boolean(formatId) || (Boolean(quality) && quality !== 'Auto Detect');
-    const isVideoPlatform = !isTorrent && (isKnownVideoHost || hasExplicitVideoFormat);
-    const isHls = !isTorrent && !isVideoPlatform && (cleanUrl.includes('.m3u8') || cleanUrl.includes('manifest.m3u8'));
-
-    // Ensure target download directory exists
-    const downloadDir = this.settings.downloadDir || path.join(process.cwd(), 'QuantumDownloads');
-    const fs = require('fs');
-    if (!fs.existsSync(downloadDir)) {
+    const isMagnet = /^magnet:\?/i.test(url);
+    if (!isMagnet && !/^[a-z][a-z0-9+.-]*:/i.test(url)) url = 'https://' + url;
+    if (!isMagnet) {
+      let parsed: URL;
       try {
-        fs.mkdirSync(downloadDir, { recursive: true });
-      } catch (e) {}
+        parsed = new URL(url);
+      } catch {
+        throw new Error('That does not look like a valid link');
+      }
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+        throw new Error('Only http(s) links and magnet links are supported');
+      }
     }
 
-    let filename = customFilename || '';
+    let host = '';
+    let pathname = '';
+    if (!isMagnet) {
+      const u = new URL(url);
+      host = u.hostname;
+      pathname = u.pathname;
+    }
+    const isTorrent = isMagnet || /\.torrent$/i.test(pathname);
+    const hasFormat = Boolean(opts.formatId) || (Boolean(opts.quality) && opts.quality !== 'Auto Detect');
+    const isVideo = !isTorrent && (VIDEO_HOSTS.test(host) || hasFormat);
+    const isHls = !isTorrent && !isVideo && /\.m3u8$/i.test(pathname);
+
+    const baseDir = this.settings.downloadDir || path.join(process.cwd(), 'QuantumDownloads');
+    let dir = baseDir;
+    if (opts.directory && path.isAbsolute(opts.directory)) dir = opts.directory;
+    fs.mkdirSync(dir, { recursive: true });
+
+    const custom = opts.filename ? sanitizeFilename(opts.filename, '') : '';
+    let filename = custom;
     if (!filename) {
       if (isMagnet) {
-        // Extract display name from magnet if available dn=
-        const dnMatch = cleanUrl.match(/[?&]dn=([^&]+)/i);
-        filename = dnMatch ? decodeURIComponent(dnMatch[1]) : `torrent_${Date.now()}`;
+        const dn = url.match(/[?&]dn=([^&]+)/i)?.[1];
+        filename = sanitizeFilename(dn ? decodeURIComponent(dn.replace(/\+/g, ' ')) : '', `torrent_${Date.now()}`);
+      } else if (isVideo) {
+        filename = 'Video';
       } else {
-        try {
-          const parsed = new URL(cleanUrl);
-          filename = path.basename(parsed.pathname) || `download_${Date.now()}`;
-        } catch {
-          filename = `download_${Date.now()}`;
-        }
+        filename = sanitizeFilename(path.posix.basename(pathname), `download_${Date.now()}`);
       }
     }
 
-    // Clean up filename and ensure proper extension
-    if (isVideoPlatform) {
-      filename = filename.replace(/[\\/:*?"<>|]/g, '_');
-      if (quality === 'audio' || quality === 'Audio Only (MP3)' || formatId === 'ba/b') {
-        if (!filename.endsWith('.mp3')) filename += '.mp3';
-      } else {
-        if (!filename.endsWith('.mp4') && !filename.endsWith('.mkv')) filename += '.mp4';
-      }
+    const audioOnly = opts.quality === 'audio' || /audio/i.test(opts.quality || '') || opts.formatId === 'ba/b';
+    if (isVideo) {
+      const ext = audioOnly ? '.mp3' : '.mp4';
+      filename = filename.replace(/\.(mp4|mkv|webm|mp3|m4a)$/i, '') + ext;
+    } else if (isHls) {
+      filename = sanitizeFilename(filename.replace(/\.m3u8$/i, ''), 'stream') + '.ts';
     }
 
-    const filepath = path.join(downloadDir, filename);
+    const filepath = uniqueFilePath(dir, filename, this.claimedPaths());
+    if (!isInsideDir(dir, filepath)) throw new Error('Invalid file name');
 
-    // Extract real YouTube thumbnail if applicable
-    let thumbnailUrl: string | undefined = undefined;
-    if (cleanUrl.includes('youtube.com') || cleanUrl.includes('youtu.be')) {
-      const ytIdMatch = cleanUrl.match(/(?:v=|\/embed\/|youtu\.be\/|\/shorts\/)([a-zA-Z0-9_-]{11})/);
-      if (ytIdMatch && ytIdMatch[1]) {
-        thumbnailUrl = `https://img.youtube.com/vi/${ytIdMatch[1]}/mqdefault.jpg`;
-      }
-    }
+    let thumbnailUrl: string | undefined;
+    const yt = url.match(/(?:youtube\.com\/(?:watch\?(?:.*&)?v=|embed\/|shorts\/)|youtu\.be\/)([a-zA-Z0-9_-]{11})/);
+    if (yt) thumbnailUrl = `https://i.ytimg.com/vi/${yt[1]}/mqdefault.jpg`;
 
+    const id = 'qd_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8);
     const task: DownloadTask = {
       id,
-      url: cleanUrl,
-      filename,
+      url,
+      filename: path.basename(filepath),
       filepath,
       totalBytes: 0,
       downloadedBytes: 0,
@@ -162,57 +184,70 @@ export class DownloadManager {
       status: 'queued',
       connections: this.settings.defaultConnections || 16,
       segments: [],
-      category: isTorrent ? 'torrent' : (category || (isHls || isVideoPlatform ? 'video' : 'other')),
+      category: isTorrent ? 'torrent' : opts.category || (isHls || isVideo ? (audioOnly ? 'audio' : 'video') : detectCategory(filename)),
       createdAt: Date.now(),
       resumable: true,
-      headers,
+      headers: sanitizeHeaders(opts.headers),
       isHls,
-      isVideoStream: isVideoPlatform,
+      isVideoStream: isVideo,
       isTorrent,
-      quality,
-      formatId,
+      quality: opts.quality,
+      formatId: opts.formatId,
       thumbnailUrl,
-      queueName: queueName || 'Default',
-      priority: priority !== undefined ? priority : 0,
+      queueName: opts.queueName || 'Default',
+      priority: Number(opts.priority) || 0,
+      autoName: !custom,
     };
 
     this.tasks.set(id, task);
     this.persist();
-    this.notifyFrontend('task-added', task);
-
-    // Check if we can start immediately
+    this.notify('task-added', task);
     this.checkQueue();
-
     return task;
   }
 
   public resumeTask(id: string): void {
     const task = this.tasks.get(id);
-    if (!task) return;
-
+    if (!task || this.workers.has(id)) return;
     if (task.status === 'paused' || task.status === 'error') {
       task.status = 'queued';
       task.errorMessage = undefined;
       this.persist();
-      this.notifyFrontend('task-updated', task);
+      this.notify('task-updated', task);
       this.checkQueue();
     }
   }
 
-  public pauseTask(id: string): void {
+  /** Discards progress and downloads the file again from the start. */
+  public restartTask(id: string): void {
     const task = this.tasks.get(id);
     if (!task) return;
-
-    const worker = this.activeWorkers.get(id);
-    if (worker) {
-      worker.pause();
-      this.activeWorkers.delete(id);
+    this.stopWorker(id);
+    if (task.status !== 'completed') safeUnlink(task.filepath);
+    task.segments = [];
+    task.downloadedBytes = 0;
+    task.totalBytes = 0;
+    task.hlsIndex = 0;
+    task.completedAt = undefined;
+    task.errorMessage = undefined;
+    if (task.status === 'completed') {
+      task.filepath = uniqueFilePath(path.dirname(task.filepath), task.filename, this.claimedPaths(id));
+      task.filename = path.basename(task.filepath);
     }
+    task.status = 'queued';
+    this.persist();
+    this.notify('task-updated', task);
+    this.checkQueue();
+  }
 
+  public pauseTask(id: string): void {
+    const task = this.tasks.get(id);
+    if (!task || (task.status !== 'downloading' && task.status !== 'queued')) return;
+    this.stopWorker(id);
     task.status = 'paused';
     task.speed = 0;
     this.persist();
-    this.notifyFrontend('task-updated', task);
+    this.notify('task-updated', task);
     this.checkQueue();
   }
 
@@ -220,143 +255,197 @@ export class DownloadManager {
     this.pauseTask(id);
   }
 
-  public pauseAllDownloading(): void {
-    for (const [id, task] of this.tasks.entries()) {
-      if (task.status === 'downloading' || task.status === 'queued') {
-        this.pauseTask(id);
-      }
+  public pauseAll(): void {
+    this.bulk = true;
+    for (const [id, task] of this.tasks) {
+      if (task.status === 'downloading' || task.status === 'queued') this.pauseTask(id);
     }
+    this.bulk = false;
+    this.persist();
   }
 
-  public resumeAllQueued(): void {
+  public resumeAll(): void {
     for (const task of this.tasks.values()) {
-      if (task.status === 'paused') {
+      if (task.status === 'paused' || task.status === 'error') {
         task.status = 'queued';
         task.errorMessage = undefined;
+        this.notify('task-updated', task);
       }
     }
     this.persist();
+    this.checkQueue();
+  }
+
+  /** Removes the task; deletes partial data, and the finished file only when asked. */
+  public deleteTask(id: string, deleteFileFromDisk = false): void {
+    const task = this.tasks.get(id);
+    if (!task) return;
+    const worker = this.workers.get(id);
+    this.workers.delete(id);
+    const incomplete = task.status !== 'completed';
+    if (worker) {
+      if (incomplete || deleteFileFromDisk) worker.cancel();
+      else worker.pause();
+    } else if ((incomplete && task.downloadedBytes > 0) || deleteFileFromDisk) {
+      if (!task.isTorrent || task.totalBytes > 0) safeUnlink(task.filepath);
+    }
+    this.tasks.delete(id);
+    this.persist();
+    this.notify('task-deleted', id);
     this.checkQueue();
   }
 
   public cancelTask(id: string): void {
-    const worker = this.activeWorkers.get(id);
-    if (worker) {
-      worker.cancel();
-      this.activeWorkers.delete(id);
+    this.deleteTask(id, false);
+  }
+
+  public clearCompleted(): void {
+    for (const [id, t] of this.tasks) {
+      if (t.status === 'completed') {
+        this.tasks.delete(id);
+        this.notify('task-deleted', id);
+      }
     }
-    this.tasks.delete(id);
     this.persist();
-    this.notifyFrontend('task-deleted', id);
-    this.checkQueue();
   }
 
-  public deleteTask(id: string, deleteFileFromDisk: boolean = false): void {
+  public openFile(id: string): Promise<string> | void {
     const task = this.tasks.get(id);
-    if (!task) return;
-
-    this.cancelTask(id);
-
-    if (deleteFileFromDisk && task.filepath) {
-      const fs = require('fs');
-      try {
-        if (fs.existsSync(task.filepath)) {
-          const stat = fs.statSync(task.filepath);
-          if (stat.isDirectory()) {
-            fs.rmSync(task.filepath, { recursive: true, force: true });
-          } else {
-            fs.unlinkSync(task.filepath);
-          }
-        }
-      } catch (e) {}
-    }
-  }
-
-  public openFile(id: string): void {
-    const task = this.tasks.get(id);
-    if (task && task.filepath) {
-      shell.openPath(task.filepath);
-    }
+    if (task?.filepath && fs.existsSync(task.filepath)) return shell.openPath(task.filepath);
   }
 
   public openFolder(id: string): void {
     const task = this.tasks.get(id);
-    if (task && task.filepath) {
-      shell.showItemInFolder(task.filepath);
+    if (!task?.filepath) return;
+    if (fs.existsSync(task.filepath)) shell.showItemInFolder(task.filepath);
+    else shell.openPath(path.dirname(task.filepath));
+  }
+
+  public cancelPendingShutdown(): boolean {
+    if (!this.shutdownPending) return false;
+    this.shutdownPending = false;
+    this.scheduler.cancelShutdown();
+    return true;
+  }
+
+  // ───────────────────────────── internals ─────────────────────────────
+
+  private claimedPaths(excludeId?: string): string[] {
+    const out: string[] = [];
+    for (const t of this.tasks.values()) if (t.id !== excludeId && t.filepath) out.push(t.filepath);
+    return out;
+  }
+
+  private stopWorker(id: string): void {
+    const worker = this.workers.get(id);
+    if (worker) {
+      this.workers.delete(id);
+      worker.pause();
     }
   }
 
   private checkQueue(): void {
-    const activeCount = Array.from(this.tasks.values()).filter(t => t.status === 'downloading').length;
-    const maxActive = this.settings.maxActiveDownloads || 4;
+    if (this.bulk) return;
+    const max = this.settings.maxActiveDownloads || 4;
+    const queued = Array.from(this.tasks.values())
+      .filter((t) => t.status === 'queued' && !this.workers.has(t.id))
+      .sort((a, b) => (b.priority || 0) - (a.priority || 0) || a.createdAt - b.createdAt);
+    for (const task of queued) {
+      if (this.workers.size >= max) break;
+      this.startTask(task);
+    }
+  }
 
-    if (activeCount >= maxActive) return;
-
-    // Pick highest priority queued task
-    const queuedTasks = Array.from(this.tasks.values())
-      .filter(t => t.status === 'queued')
-      .sort((a, b) => (b.priority || 0) - (a.priority || 0));
-
-    if (queuedTasks.length > 0) {
-      const nextTask = queuedTasks[0];
-      this.startTask(nextTask);
-    } else if (activeCount === 0) {
-      // Queue is completely finished!
-      if (this.settings.autoShutdownOnQueueComplete || (this.settings.schedule?.enabled && this.settings.schedule.autoShutdownOnComplete)) {
-        this.scheduler.shutdownSystem();
-      }
+  private maybeShutdownAfterQueue(): void {
+    const busy = Array.from(this.tasks.values()).some((t) => t.status === 'downloading' || t.status === 'queued');
+    if (busy || this.shutdownPending) return;
+    const s = this.settings;
+    if (s.autoShutdownOnQueueComplete || (s.schedule?.enabled && s.schedule.autoShutdownOnComplete)) {
+      this.shutdownPending = true;
+      this.persist();
+      this.scheduler.shutdownSystem();
+      this.notify('shutdown-scheduled', { seconds: 60 });
     }
   }
 
   private startTask(task: DownloadTask): void {
-    if (this.activeWorkers.has(task.id)) return;
+    if (this.workers.has(task.id)) return;
 
-    const events = {
-      onProgress: (t: DownloadTask) => {
-        this.notifyFrontend('task-progress', t);
-      },
-      onComplete: (t: DownloadTask) => {
-        this.activeWorkers.delete(t.id);
+    let worker: Worker;
+    const guard = <T extends any[]>(fn: (...a: T) => void) => (...a: T) => {
+      // Ignore late events from a worker that was paused or replaced
+      if (this.workers.get(task.id) === worker) fn(...a);
+    };
+    const events: DownloaderEvents = {
+      onProgress: guard((t: DownloadTask) => this.notify('task-progress', t)),
+      onComplete: guard((t: DownloadTask) => {
+        this.workers.delete(t.id);
         this.persist();
-        this.notifyFrontend('task-completed', t);
+        this.notify('task-completed', t);
+        this.showNotification('Download complete', t.filename);
         this.checkQueue();
-      },
-      onError: (t: DownloadTask, error: Error) => {
-        this.activeWorkers.delete(t.id);
+        this.maybeShutdownAfterQueue();
+      }),
+      onError: guard((t: DownloadTask, error: Error) => {
+        this.workers.delete(t.id);
         t.status = 'error';
         t.errorMessage = error.message;
         t.speed = 0;
         this.persist();
-        this.notifyFrontend('task-updated', t);
-        this.notifyFrontend('task-error', { id: t.id, error: error.message });
+        this.notify('task-updated', t);
+        this.notify('task-error', { id: t.id, error: error.message });
+        this.showNotification('Download failed', `${t.filename}: ${error.message}`);
         this.checkQueue();
-      },
+      }),
+      reservePath: (dir: string, filename: string) =>
+        uniqueFilePath(dir, sanitizeFilename(filename), this.claimedPaths(task.id)),
     };
 
-    let worker: SegmentedDownloader | HlsDownloader | VideoStreamDownloader | TorrentDownloader;
-    if (task.isTorrent) {
-      worker = new TorrentDownloader(task, events);
-    } else if (task.isVideoStream) {
-      worker = new VideoStreamDownloader(task, events);
-    } else if (task.isHls) {
-      worker = new HlsDownloader(task, events);
-    } else {
-      worker = new SegmentedDownloader(task, events, this.rateLimiter);
-    }
+    if (task.isTorrent) worker = new TorrentDownloader(task, events);
+    else if (task.isVideoStream) worker = new VideoStreamDownloader(task, events);
+    else if (task.isHls) worker = new HlsDownloader(task, events);
+    else worker = new SegmentedDownloader(task, events, this.rateLimiter);
 
-    this.activeWorkers.set(task.id, worker);
-    worker.start();
+    this.workers.set(task.id, worker);
+    task.status = 'downloading';
+    task.lastTry = new Date().toISOString();
     this.persist();
-    this.notifyFrontend('task-updated', task);
+    this.notify('task-updated', task);
+    worker.start().catch((err) => events.onError(task, err instanceof Error ? err : new Error(String(err))));
   }
 
-  private notifyFrontend(channel: string, data: any): void {
-    if (this.mainWindow && !this.mainWindow.isDestroyed()) {
-      this.mainWindow.webContents.send(channel, data);
+  private showNotification(title: string, body: string): void {
+    try {
+      const win = this.mainWindow;
+      if (win && !win.isDestroyed() && win.isFocused()) return;
+      if (Notification.isSupported()) new Notification({ title, body, silent: false }).show();
+    } catch {
+      /* ignore */
     }
+  }
+
+  private notify(channel: string, data: any): void {
+    const win = this.mainWindow;
+    if (win && !win.isDestroyed()) win.webContents.send(channel, data);
   }
 
   private persist(): void {
     this.storage.saveDownloads(Array.from(this.tasks.values()));
   }
+}
+
+function clamp(n: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, Math.round(n)));
+}
+
+function sanitizeHeaders(h?: Record<string, string>): Record<string, string> | undefined {
+  if (!h || typeof h !== 'object') return undefined;
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(h)) {
+    if (typeof v !== 'string' || !v) continue;
+    if (!/^[A-Za-z0-9-]{1,64}$/.test(k)) continue;
+    if (/[\r\n]/.test(v)) continue;
+    out[k] = v.slice(0, 8192);
+  }
+  return Object.keys(out).length ? out : undefined;
 }

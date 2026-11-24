@@ -1,4 +1,4 @@
-import { exec } from 'child_process';
+import { execFile } from 'child_process';
 import { QueueSchedule } from './types';
 
 export class SchedulerManager {
@@ -61,14 +61,19 @@ export class SchedulerManager {
   }
 
   public shutdownSystem(): void {
-    console.log('[Scheduler] Executing system shutdown...');
+    console.log('[Scheduler] Queue finished: scheduling system shutdown in 60s');
     if (process.platform === 'win32') {
-      exec('shutdown /s /t 60 /c "Quantum Downloader finished queue. Shutting down in 60s."');
+      execFile('shutdown', ['/s', '/t', '60', '/c', 'Quantum Downloader finished all downloads. Shutting down in 60 seconds.'], { windowsHide: true }, () => {});
     } else if (process.platform === 'darwin') {
-      exec('osascript -e \'tell application "System Events" to shut down\'');
+      execFile('osascript', ['-e', 'tell application "System Events" to shut down'], () => {});
     } else {
-      exec('systemctl poweroff || shutdown -h now');
+      execFile('shutdown', ['-h', '+1'], () => {});
     }
+  }
+
+  public cancelShutdown(): void {
+    if (process.platform === 'win32') execFile('shutdown', ['/a'], { windowsHide: true }, () => {});
+    else if (process.platform !== 'darwin') execFile('shutdown', ['-c'], () => {});
   }
 
   public destroy(): void {

@@ -56,6 +56,12 @@ export interface DownloadTask {
   logs?: string[];
   queueName?: string;
   priority?: number; // Higher number = higher priority
+  /** True when the name came from the URL, so the server/title may replace it */
+  autoName?: boolean;
+  /** HLS: index of the next segment to write, number of segments, chosen variant URL */
+  hlsIndex?: number;
+  hlsCount?: number;
+  hlsSourceUrl?: string;
 }
 
 export interface QueueSchedule {
